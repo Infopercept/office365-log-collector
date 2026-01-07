@@ -1,0 +1,79 @@
+# Production Docker Compose - Office365 Collector + Fluentd
+#
+# Quick Start:
+#   1. Copy config.production.yaml to config.yaml
+#   2. Fill in your Office365 credentials
+#   3. Run: docker-compose -f docker-compose.production.yaml up -d
+#
+version: '3.8'
+
+services:
+  # Office365 Audit Log Collector (Enhanced Multi-Tenant Version)
+  office365-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: office365-collector:latest
+    container_name: office365-collector
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - collector-state:/app/state
+    environment:
+      - RUST_LOG=info
+      - TZ=UTC
+    depends_on:
+      - fluentd
+    networks:
+      - logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Fluentd - Receives Office365 logs and forwards to SIEM
+  fluentd:
+    image: fluent/fluentd:latest
+    container_name: fluentd
+    restart: unless-stopped
+    ports:
+      - "24224:24224"      # Forward protocol (collector → fluentd)
+      - "24224:24224/udp"
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - ./fluentd/plugins:/fluentd/plugins:ro
+      - fluentd-logs:/fluentd/log
+    networks:
+      - logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Elasticsearch (as SIEM backend example)
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+  #   container_name: elasticsearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+  #   ports:
+  #     - "9200:9200"
+  #   volumes:
+  #     - es-data:/usr/share/elasticsearch/data
+  #   networks:
+  #     - logging
+
+volumes:
+  collector-state:
+    driver: local
+  fluentd-logs:
+    driver: local
+  # es-data:
+  #   driver: local
+
+networks:
+  logging:
+    driver: bridge

@@ -1,0 +1,37 @@
+# Office365 Audit Log Collector Configuration
+# Copy this to config.yaml and fill in your credentials
+
+enabled: true
+
+# Daemon mode: Run continuously with this interval
+interval: "5m"
+
+# Skip historical logs on first run (recommended for production)
+only_future_events: true
+
+# Your Office365 tenant credentials
+tenants:
+  - tenant_id: "YOUR-TENANT-ID"           # Azure AD > Overview > Tenant ID
+    client_id: "YOUR-CLIENT-ID"           # App Registration > Application ID
+    client_secret: "YOUR-CLIENT-SECRET"   # App Registration > Certificates & secrets
+    api_type: "commercial"                # commercial, gcc, or gcc-high
+
+# Subscriptions to collect
+subscriptions:
+  - "Audit.AzureActiveDirectory"
+  - "Audit.Exchange"
+  - "Audit.SharePoint"
+  - "Audit.General"
+  - "DLP.All"
+
+# Output configuration for Fluentd
+output:
+  fluentd:
+    tenantName: "TestOrg"    # This becomes the Fluentd tag - must match fluentd.conf
+    address: "localhost"
+    port: 24224
+
+# Logging configuration
+log:
+  path: ""        # Empty = stdout (recommended for systemd)
+  debug: false    # Set to true for troubleshooting

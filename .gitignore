@@ -60,4 +60,29 @@ target/
 \.idea/
 venv/
 
+# Project-specific
 known_content
+known_blobs
+credentials.yaml
+
+# Config files with secrets - use config.example.yaml as template
+config/config.yaml
+config/office365-creds
+config/config.production.yaml
+config/config-test.yaml
+config/config-file-test.yaml
+
+# State files
+office365-*.json
+
+# Runtime directories
+data/
+test-outputs/
+output/
+
+# Logs
+*.log
+!test-run-output.log
+
+# Fluentd local config
+fluentd/

@@ -1,0 +1,49 @@
+# Production Configuration - Office365 Audit Log Collector
+enabled: true
+
+# DAEMON MODE - Runs continuously, fetches every 5 minutes
+interval: "5m"  # Collection interval: "5m", "10m", "1h", etc.
+
+# Only collect NEW events (don't fetch historical data on startup)
+only_future_events: true
+
+# Your Office365 credentials
+tenants:
+  - tenant_id: "YOUR-TENANT-ID"
+    client_id: "YOUR-CLIENT-ID"
+    client_secret: "YOUR-CLIENT-SECRET"
+    api_type: "commercial"
+
+# Subscribe to all 5 main feeds
+subscriptions:
+  - "DLP.All"
+  - "Audit.Exchange"
+  - "Audit.SharePoint"
+  - "Audit.AzureActiveDirectory"
+  - "Audit.General"
+
+# PRODUCTION: Send to Fluentd (recommended)
+output:
+  fluentd:
+    enabled: true
+    tenantName: "MyCompany"
+    address: "localhost"  # or "fluentd" if using Docker
+    port: 24224
+
+  # ALTERNATIVE: File output (for testing or backup)
+  # file:
+  #   path: "output/office365-audit.json"
+  #   separateByContentType: true  # Creates 5 separate files
+
+log:
+  path: "/var/log/office365-collector.log"
+  debug: false
+
+# Advanced settings
+collect:
+  workingDir: "/var/lib/office365-collector"
+  cacheSize: 500000
+  maxThreads: 50
+  retries: 3
+  skipKnownLogs: true  # Skip already-collected logs
+  hoursToCollect: 24   # Look back 24 hours for new data

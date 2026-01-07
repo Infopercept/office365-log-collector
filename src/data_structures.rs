@@ -121,6 +121,7 @@ pub struct GetContentConfig {
     pub content_error_tx: Sender<ContentToRetrieve>,
     pub status_tx: Sender<StatusMessage>,
     pub threads: usize,
+    pub max_response_size: Option<usize>,  // Maximum response size in bytes
 }
 
 
@@ -164,16 +165,19 @@ pub struct RunState {
 /// Complete all preparation steps in README.MD
 /// to prepare your tenant for collection. Then prepare your config file to specify outputs and
 /// collection options (check the examples folder in the repo). Then run the tool with below options.
+///
+/// Note: tenant_id, client_id, and secret_key are now configured in the YAML config file
+/// under the 'tenants' section. Command-line args are kept for backward compatibility.
 pub struct CliArgs {
 
-    #[arg(long, help = "ID of tenant to retrieve logs for.")]
-    pub tenant_id: String,
+    #[arg(long, help = "(DEPRECATED: Use config file) ID of tenant to retrieve logs for.")]
+    pub tenant_id: Option<String>,
 
-    #[arg(long, help = "Client ID of app registration used to retrieve logs.")]
-    pub client_id: String,
+    #[arg(long, help = "(DEPRECATED: Use config file) Client ID of app registration used to retrieve logs.")]
+    pub client_id: Option<String>,
 
-    #[arg(long, help = "Secret key of app registration used to retrieve logs")]
-    pub secret_key: String,
+    #[arg(long, help = "(DEPRECATED: Use config file) Secret key of app registration used to retrieve logs")]
+    pub secret_key: Option<String>,
 
     #[arg(short, long, default_value = "12345678-1234-1234-1234-123456789123", help = "Publisher ID, set to tenant-id if left empty.")]
     pub publisher_id: String,

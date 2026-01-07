@@ -1,0 +1,72 @@
+# Production Configuration for Office365 Audit Log Collector
+# Copy this to config.production.yaml and fill in your credentials
+
+enabled: true
+
+# Daemon mode: Run collection every N minutes
+# Examples: "5m", "10m", "30m", "1h"
+interval: "5m"
+
+# Start collecting from current time (don't pull historical logs on first run)
+# Set to false if you want to collect historical logs
+only_future_events: true
+
+# Your Office365 Tenant(s)
+# You can add multiple tenants for multi-tenant deployments
+tenants:
+  - tenant_id: "YOUR-TENANT-ID"              # Get from Azure Portal > Azure Active Directory > Overview
+    client_id: "YOUR-APPLICATION-CLIENT-ID"  # Get from Azure AD > App Registrations > Your App > Application (client) ID
+    client_secret: "YOUR-CLIENT-SECRET"      # Get from Azure AD > App Registrations > Your App > Certificates & secrets
+    api_type: "commercial"                   # Options: "commercial", "gcc", "gcc-high"
+
+  # Add more tenants if needed:
+  # - tenant_id: "SECOND-TENANT-ID"
+  #   client_id: "SECOND-CLIENT-ID"
+  #   client_secret: "SECOND-CLIENT-SECRET"
+  #   api_type: "commercial"
+
+# Audit log subscriptions to collect
+# Comment out any you don't need
+subscriptions:
+  - "Audit.Exchange"              # Exchange admin, mailbox operations, mail submission
+  - "Audit.SharePoint"            # SharePoint/OneDrive file operations, sharing
+  - "Audit.AzureActiveDirectory"  # Azure AD operations, user logins
+  - "Audit.General"               # Teams, PowerBI, Yammer, Forms, PowerApps, etc.
+  - "DLP.All"                     # DLP policy matches (RecordType 28 ONLY - filtered!)
+
+# Output configuration
+output:
+  # File output (Vector will read this)
+  file:
+    path: "/var/logs/office365/office365.json"
+    separator: "\n"  # One JSON object per line (JSONL format)
+
+  # Optional: Fluentd output (if you're using Fluentd instead of Vector)
+  # fluentd:
+  #   tenantName: "YourOrgName"
+  #   address: "localhost"
+  #   port: 24224
+
+# Logging configuration
+log:
+  path: "/var/logs/office365/collector.log"  # Empty string "" = stdout
+  debug: false  # Set to true for detailed debugging (increases log volume)
+
+# How to get Azure credentials:
+#
+# 1. Go to Azure Portal: https://portal.azure.com
+# 2. Navigate to: Azure Active Directory > App Registrations
+# 3. Click "New registration"
+# 4. Name: "Office365 Audit Log Collector"
+# 5. Click "Register"
+# 6. Copy "Application (client) ID" → This is your client_id
+# 7. Copy "Directory (tenant) ID" → This is your tenant_id
+# 8. Go to "Certificates & secrets" > "New client secret"
+# 9. Create a secret and copy it immediately → This is your client_secret
+# 10. Go to "API permissions" > "Add a permission" > "Office 365 Management APIs"
+# 11. Add these permissions:
+#     - ActivityFeed.Read (Application)
+#     - ServiceHealth.Read (Application)
+# 12. Click "Grant admin consent" (requires admin privileges)
+#
+# Wait 5-10 minutes for permissions to propagate, then run the collector!

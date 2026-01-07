@@ -1,0 +1,53 @@
+# Docker build optimization - exclude these files/directories
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Build artifacts
+target/
+*.log
+*.tmp
+
+# Documentation
+*.md
+docs/
+
+# Test files
+test.sh
+config-test.yaml
+fluentd-test.conf
+
+# State files
+state/
+*.json
+
+# Docker files (not needed in build context)
+Dockerfile
+docker-compose*.yaml
+docker-compose*.yml
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Fluentd logs
+fluentd/log/
+
+# Credentials (security)
+config.yaml
+secrets/
+*.secret
+*.key
+*.pem
+
+# Release artifacts
+Release/
+
+# OS
+.DS_Store
+Thumbs.db

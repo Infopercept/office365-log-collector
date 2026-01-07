@@ -10,8 +10,18 @@ use crate::data_structures::ArbitraryJson;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    pub enabled: Option<bool>,
+    pub interval: Option<String>,  // e.g., "5m", "1h", "30s"
+    pub curl_max_size: Option<String>,  // e.g., "1M", "500K", "2G"
+    pub only_future_events: Option<bool>,
+    #[serde(rename = "workingDir")]
+    pub working_dir: Option<String>,  // Directory for state files and known_blobs
     pub log: Option<LogSubConfig>,
-    pub collect: CollectSubConfig,
+    #[serde(default)]
+    pub tenants: Vec<TenantConfig>,  // Default to empty vec for backward compatibility
+    #[serde(default)]
+    pub subscriptions: Vec<String>,  // Default to empty vec, Dynamic content types
+    pub collect: Option<CollectSubConfig>,  // Now optional, using new structure
     pub output: OutputSubConfig
 }
 impl Config {
@@ -26,23 +36,115 @@ impl Config {
         config
     }
 
-    pub fn get_needed_runs(&self) -> HashMap<String, Vec<(String, String)>> {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 
+    pub fn get_interval_seconds(&self) -> u64 {
+        if let Some(interval_str) = &self.interval {
+            Self::parse_interval(interval_str)
+        } else if let Some(ref collect) = self.collect {
+            // Fallback to legacy hoursToCollect if present
+            collect.hours_to_collect.unwrap_or(24) as u64 * 3600
+        } else {
+            300  // Default 5 minutes
+        }
+    }
+
+    pub fn get_max_size_bytes(&self) -> Option<usize> {
+        if let Some(size_str) = &self.curl_max_size {
+            Some(Self::parse_size(size_str))
+        } else {
+            None
+        }
+    }
+
+    fn parse_interval(s: &str) -> u64 {
+        let s = s.trim();
+        if s.ends_with('s') {
+            s[..s.len()-1].parse().unwrap_or(300)
+        } else if s.ends_with('m') {
+            s[..s.len()-1].parse::<u64>().unwrap_or(5) * 60
+        } else if s.ends_with('h') {
+            s[..s.len()-1].parse::<u64>().unwrap_or(1) * 3600
+        } else if s.ends_with('d') {
+            s[..s.len()-1].parse::<u64>().unwrap_or(1) * 86400
+        } else {
+            s.parse().unwrap_or(300)  // Assume seconds if no unit
+        }
+    }
+
+    fn parse_size(s: &str) -> usize {
+        let s = s.trim().to_uppercase();
+        if s.ends_with('K') {
+            s[..s.len()-1].parse::<usize>().unwrap_or(1024) * 1024
+        } else if s.ends_with('M') {
+            s[..s.len()-1].parse::<usize>().unwrap_or(1) * 1024 * 1024
+        } else if s.ends_with('G') {
+            s[..s.len()-1].parse::<usize>().unwrap_or(1) * 1024 * 1024 * 1024
+        } else {
+            s.parse().unwrap_or(1024 * 1024)  // Assume bytes if no unit
+        }
+    }
+
+    pub fn get_subscriptions(&self) -> Vec<String> {
+        if !self.subscriptions.is_empty() {
+            self.subscriptions.clone()
+        } else if let Some(ref collect) = self.collect {
+            // Fallback to legacy content_types
+            collect.content_types.get_content_type_strings()
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn get_working_dir(&self) -> String {
+        // Check top-level workingDir first, then fall back to collect.workingDir
+        if let Some(ref dir) = self.working_dir {
+            dir.clone()
+        } else if let Some(ref collect) = self.collect {
+            collect.working_dir.clone().unwrap_or_else(|| "./".to_string())
+        } else {
+            "./".to_string()
+        }
+    }
+
+    pub fn get_needed_runs(&self) -> HashMap<String, Vec<(String, String)>> {
+        self.get_needed_runs_from(None)
+    }
+
+    /// Get needed runs with optional start time override (for only_future_events)
+    /// If start_from is provided, use it as the start time instead of NOW - hours_to_collect
+    pub fn get_needed_runs_from(&self, start_from: Option<DateTime<Utc>>) -> HashMap<String, Vec<(String, String)>> {
         let mut runs: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let end_time = chrono::Utc::now();
 
-        let hours_to_collect = self.collect.hours_to_collect.unwrap_or(24);
-        if hours_to_collect > 168 {
-            panic!("Hours to collect cannot be more than 168 due to Office API limits");
-        }
-        for content_type in self.collect.content_types.get_content_type_strings() {
-            runs.insert(content_type.clone(), vec!());
-            let mut start_time = end_time - chrono::Duration::try_hours(hours_to_collect)
-                .unwrap();
+        let start_time_base = if let Some(from) = start_from {
+            // Use provided start time (from state's last_log_time)
+            from
+        } else {
+            // Fall back to hours_to_collect calculation
+            let hours_to_collect = if let Some(ref collect) = self.collect {
+                collect.hours_to_collect.unwrap_or(24)
+            } else {
+                24
+            };
 
+            if hours_to_collect > 168 {
+                panic!("Hours to collect cannot be more than 168 due to Office API limits");
+            }
+
+            end_time - chrono::Duration::try_hours(hours_to_collect).unwrap()
+        };
+
+        let subscriptions = self.get_subscriptions();
+        for content_type in subscriptions {
+            runs.insert(content_type.clone(), vec!());
+            let mut start_time = start_time_base;
+
+            // Split into 24-hour chunks if needed (API limit)
             while end_time - start_time > chrono::Duration::try_hours(24).unwrap() {
-                let split_end_time = start_time + chrono::Duration::try_hours(24)
-                    .unwrap();
+                let split_end_time = start_time + chrono::Duration::try_hours(24).unwrap();
                 let formatted_start_time = start_time.format("%Y-%m-%dT%H:%M:%SZ").to_string();
                 let formatted_end_time = split_end_time.format("%Y-%m-%dT%H:%M:%SZ").to_string();
                 runs.get_mut(&content_type).unwrap().push((formatted_start_time, formatted_end_time));
@@ -56,21 +158,15 @@ impl Config {
     }
 
     pub fn load_known_blobs(&self) -> HashMap<String, String> {
-        let working_dir = if let Some(i) = &self.collect.working_dir {
-            i.as_str()
-        } else {
-            "./"
-        };
-
+        let working_dir = self.get_working_dir();
         let file_name = Path::new("known_blobs");
-        let mut path = Path::new(working_dir).join(file_name);
+        let mut path = Path::new(&working_dir).join(file_name);
         self.load_known_content(path.as_mut_os_string())
     }
 
     pub fn save_known_blobs(&mut self, known_blobs: &HashMap<String, String>) {
-
-        let mut known_blobs_path = Path::new(self.collect.working_dir.as_ref()
-            .unwrap_or(&"./".to_string())).join(Path::new("known_blobs"));
+        let working_dir = self.get_working_dir();
+        let mut known_blobs_path = Path::new(&working_dir).join(Path::new("known_blobs"));
         self.save_known_content(known_blobs, &known_blobs_path.as_mut_os_string())
     }
 
@@ -92,14 +188,14 @@ impl Config {
             // Skip load expired content
             let now = Utc::now();
             if let Some((id, creation_time)) = line.split_once(',') {
-                let invalidated = if let Ok(i) =
+                let is_valid = if let Ok(i) =
                     NaiveDateTime::parse_from_str(creation_time, "%Y-%m-%dT%H:%M:%S.%fZ") {
                     let time_utc = DateTime::<Utc>::from_naive_utc_and_offset(i, Utc);
-                    now >= time_utc
+                    now < time_utc  // Content is valid if current time is BEFORE expiration
                 } else {
-                    true
+                    false  // Invalid timestamp = don't load
                 };
-                if !invalidated {
+                if is_valid {
                     known_content.insert(id.trim().to_string(), creation_time.trim().to_string());
                 }
             }
@@ -118,6 +214,51 @@ impl Config {
         writer.flush().unwrap();
     }
 
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct TenantConfig {
+    pub tenant_id: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub client_secret_path: Option<String>,
+    pub api_type: Option<String>,  // commercial, gcc, gcc-high
+}
+
+impl TenantConfig {
+    pub fn get_endpoints(&self) -> (String, String) {
+        let api_type = self.api_type.as_deref().unwrap_or("commercial");
+        match api_type {
+            "commercial" => (
+                "https://login.microsoftonline.com".to_string(),
+                "https://manage.office.com".to_string()
+            ),
+            "gcc" => (
+                "https://login.microsoftonline.com".to_string(),
+                "https://manage-gcc.office.com".to_string()
+            ),
+            "gcc-high" => (
+                "https://login.microsoftonline.us".to_string(),
+                "https://manage.office365.us".to_string()
+            ),
+            _ => panic!("Invalid api_type: {}. Must be 'commercial', 'gcc', or 'gcc-high'", api_type)
+        }
+    }
+
+    pub fn get_secret(&self) -> Result<String, String> {
+        if let Some(secret) = &self.client_secret {
+            return Ok(secret.clone());
+        }
+
+        if let Some(secret_path) = &self.client_secret_path {
+            match std::fs::read_to_string(secret_path) {
+                Ok(content) => Ok(content.trim().to_string()),
+                Err(e) => Err(format!("Failed to read secret from {}: {}", secret_path, e))
+            }
+        } else {
+            Err("Either client_secret or client_secret_path must be provided".to_string())
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]

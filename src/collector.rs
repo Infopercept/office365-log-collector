@@ -5,7 +5,7 @@ use std::ops::Div;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Result;
-use log::{warn, error, info};
+use log::{warn, error, info, debug};
 use futures::{SinkExt};
 use futures::channel::mpsc::channel;
 use futures::channel::mpsc::{Sender, Receiver};
@@ -18,6 +18,7 @@ use crate::api_connection;
 use crate::api_connection::ApiConnection;
 use crate::config::{Config, ContentTypesSubConfig};
 use crate::data_structures::{ArbitraryJson, Caches, CliArgs, ContentToRetrieve, JsonList, RunState};
+use crate::state::StateManager;
 use crate::interfaces::azure_oms_interface::OmsInterface;
 use crate::interfaces::interface::Interface;
 use crate::interfaces::file_interface::FileInterface;
@@ -36,6 +37,7 @@ use crate::interfaces::interactive_interface::InteractiveInterface;
 /// interfaces. Active interfaces are determined by the config file passed in by the user.
 pub struct Collector {
     config: Config,
+    tenant_id: String,
     interfaces: Vec<Box<dyn Interface + Send>>,
     result_rx: Receiver<(String, ContentToRetrieve)>,
     stats_rx: Receiver<(usize, usize, usize, usize)>,
@@ -50,12 +52,14 @@ impl Collector {
 
     pub async fn new(args: CliArgs,
                      config: Config,
+                     tenant: crate::config::TenantConfig,
                      runs: HashMap<String, Vec<(String, String)>>,
                      state: Arc<Mutex<RunState>>,
-                     interactive_sender: Option<UnboundedSender<Vec<String>>> 
+                     interactive_sender: Option<UnboundedSender<Vec<String>>>
     ) -> Result<Collector> {
 
-        info!("Initializing collector.");
+        info!("Initializing collector for tenant {}.", tenant.tenant_id);
+
         // Initialize interfaces
         let mut interfaces: Vec<Box<dyn Interface + Send>> = Vec::new();
         if args.interactive {
@@ -75,29 +79,55 @@ impl Collector {
         }
 
         // Initialize collector threads
-        let api = api_connection::get_api_connection(args.clone(), config.clone()).await?;
+        let tenant_id = tenant.tenant_id.clone();
+        let api = api_connection::get_api_connection(args.clone(), config.clone(), tenant).await?;
         api.subscribe_to_feeds().await?;
 
         let known_blobs = config.load_known_blobs();
+
+        // Get content types/subscriptions - convert dynamic subscriptions to ContentTypesSubConfig
+        let content_types_config = if let Some(ref collect) = config.collect {
+            collect.content_types
+        } else {
+            // Convert Vec<String> subscriptions to ContentTypesSubConfig
+            let subs = config.get_subscriptions();
+            ContentTypesSubConfig {
+                general: Some(subs.contains(&"Audit.General".to_string())),
+                azure_active_directory: Some(subs.contains(&"Audit.AzureActiveDirectory".to_string())),
+                exchange: Some(subs.contains(&"Audit.Exchange".to_string())),
+                share_point: Some(subs.contains(&"Audit.SharePoint".to_string())),
+                dlp: Some(subs.contains(&"DLP.All".to_string())),
+            }
+        };
+
         let (result_rx, stats_rx, kill_tx) =
             get_available_content(api,
-                                  config.collect.content_types,
+                                  content_types_config,
                                   runs.clone(),
                                   &config,
                                   known_blobs.clone(),
                                   state);
 
         // Initialize collector
-        let cache_size = config.collect.cache_size.unwrap_or(500000);
+        let cache_size = if let Some(ref collect) = config.collect {
+            collect.cache_size.unwrap_or(500000)
+        } else {
+            500000
+        };
         let cache = Caches::new(cache_size);
-        let filters =
-                if let Some(filter_config) = &config.collect.filter {
-            filter_config.get_filters()
+        let filters = if let Some(ref collect) = config.collect {
+            if let Some(filter_config) = &collect.filter {
+                filter_config.get_filters()
+            } else {
+                HashMap::new()
+            }
         } else {
             HashMap::new()
         };
+
         let collector = Collector {
             config,
+            tenant_id,
             interfaces,
             result_rx,
             stats_rx,
@@ -116,7 +146,12 @@ impl Collector {
 
         let start = Instant::now();
         loop {
-            if let Some(timeout) = self.config.collect.global_timeout {
+            let timeout = if let Some(ref collect) = self.config.collect {
+                collect.global_timeout
+            } else {
+                None
+            };
+            if let Some(timeout) = timeout {
                 if timeout > 0 && start.elapsed().as_secs().div(60) as usize >= timeout {
                     warn!("Global timeout expired, request collector stop.");
                     self.kill_tx.blocking_send(true).unwrap();
@@ -137,6 +172,26 @@ impl Collector {
 
     pub fn end_run(&mut self) {
         self.config.save_known_blobs(&self.known_blobs);
+
+        // Update state with current time for only_future_events
+        if self.config.only_future_events.unwrap_or(false) {
+            let working_dir = self.config.get_working_dir();
+            let state_manager = StateManager::new(&working_dir);
+            let now = chrono::Utc::now();
+
+            for subscription in self.config.get_subscriptions() {
+                let state = crate::state::TenantSubscriptionState {
+                    last_log_time: now,
+                    last_run: now,
+                    first_run: false,
+                };
+                if let Err(e) = state_manager.save_state(&self.tenant_id, &subscription, &state) {
+                    error!("Failed to update state for {}/{}: {}", self.tenant_id, subscription, e);
+                } else {
+                    info!("Updated state for {}/{}: last_log_time={}", self.tenant_id, subscription, now);
+                }
+            }
+        }
     }
 
     pub async fn check_results(&mut self) -> usize {
@@ -172,6 +227,11 @@ impl Collector {
     }
 
     async fn handle_log(&mut self, mut log: ArbitraryJson, content: &ContentToRetrieve) {
+
+        // Filter by subscription name - trust Microsoft's subscription assignment
+        // Each log from Microsoft includes a "Subscription" field
+        // If we subscribed to "DLP.All", all logs from that feed are DLP logs (RecordType 11, 13, 28, etc.)
+        // No need to filter by RecordType - Microsoft already categorizes them correctly
 
         if let Some(filters) = self.filters.get(&content.content_type) {
             for (k, v) in filters.iter() {
@@ -262,51 +322,65 @@ fn initialize_channels(
     // Create channels to communicate with async closures
     let (status_tx, status_rx):
         (Sender<data_structures::StatusMessage>,
-         Receiver<data_structures::StatusMessage>) = channel(100000);
+         Receiver<data_structures::StatusMessage>) = channel(10000);
 
     let (blobs_tx, blobs_rx):
         (Sender<(String, String)>,
-         Receiver<(String, String)>) = channel(100000);
+         Receiver<(String, String)>) = channel(10000);
 
     let (blob_error_tx, blob_error_rx):
         (Sender<(String, String)>,
-         Receiver<(String, String)>) = channel(100000);
+         Receiver<(String, String)>) = channel(10000);
 
     let (content_tx, content_rx):
         (Sender<ContentToRetrieve>,
-         Receiver<ContentToRetrieve>) = channel(100000);
+         Receiver<ContentToRetrieve>) = channel(10000);
 
     let (content_error_tx, content_error_rx):
         (Sender<ContentToRetrieve>,
-         Receiver<ContentToRetrieve>) = channel(100000000);
+         Receiver<ContentToRetrieve>) = channel(10000);
 
     let (result_tx, result_rx):
         (Sender<(String, ContentToRetrieve)>,
-         Receiver<(String, ContentToRetrieve)>) = channel(100000000);
+         Receiver<(String, ContentToRetrieve)>) = channel(10000);
 
     let (stats_tx, stats_rx):
         (Sender<(usize, usize, usize, usize)>,
-         Receiver<(usize, usize, usize, usize)>) = channel(100000000);
+         Receiver<(usize, usize, usize, usize)>) = channel(10000);
 
     let (kill_tx, kill_rx): (tokio::sync::mpsc::Sender<bool>,
                              tokio::sync::mpsc::Receiver<bool>) = tokio::sync::mpsc::channel(1000);
 
+    let max_threads = config.collect.as_ref()
+        .and_then(|c| c.max_threads)
+        .unwrap_or(50);
+    let duplicate = config.collect.as_ref()
+        .and_then(|c| c.duplicate)
+        .unwrap_or(1);
+    let retries = config.collect.as_ref()
+        .and_then(|c| c.retries)
+        .unwrap_or(3);
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+
     let blob_config = data_structures::GetBlobConfig {
-        client: reqwest::Client::new(),
+        client: client.clone(),
         headers: api.headers.clone(),
         status_tx: status_tx.clone(), blobs_tx: blobs_tx.clone(),
         blob_error_tx: blob_error_tx.clone(), content_tx: content_tx.clone(),
-        threads: config.collect.max_threads.unwrap_or(50),
-        duplicate: config.collect.duplicate.unwrap_or(1),
+        threads: max_threads,
+        duplicate,
     };
 
     let content_config = data_structures::GetContentConfig {
-        client: reqwest::Client::new(),
+        client: client.clone(),
         headers: api.headers.clone(),
         result_tx: result_tx.clone(),
         content_error_tx: content_error_tx.clone(),
         status_tx: status_tx.clone(),
-        threads: config.collect.max_threads.unwrap_or(50)
+        threads: max_threads,
+        max_response_size: config.get_max_size_bytes(),
     };
 
     let message_loop_config = data_structures::MessageLoopConfig {
@@ -318,7 +392,7 @@ fn initialize_channels(
         status_rx,
         blob_error_rx,
         content_types,
-        retries: config.collect.retries.unwrap_or(3),
+        retries,
         kill_rx,
     };
     (blob_config, content_config, message_loop_config, blobs_rx, content_rx, result_rx,
@@ -513,6 +587,8 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                 config.content_tx.send(content).await.unwrap();
             }
         }
+        // Sleep briefly to prevent CPU spinning in busy-wait loop
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
     // We send back stats after exiting the loop, signalling the end of the run.
     let stats = state.lock().await.stats.clone();

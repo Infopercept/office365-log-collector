@@ -15,11 +15,12 @@ use serde_json::Value;
 
 
 /// Return a logged in API connection object. Use the Headers value to make API requests.
-pub async fn get_api_connection(args: CliArgs, config: Config) -> Result<ApiConnection> {
+pub async fn get_api_connection(args: CliArgs, config: Config, tenant: crate::config::TenantConfig) -> Result<ApiConnection> {
 
     let mut api = ApiConnection {
         args,
         config,
+        tenant,
         headers: HeaderMap::new(),
     };
     api.login().await?;
@@ -33,23 +34,26 @@ pub async fn get_api_connection(args: CliArgs, config: Config) -> Result<ApiConn
 pub struct ApiConnection {
     pub args: CliArgs,
     pub config: Config,
+    pub tenant: crate::config::TenantConfig,
     pub headers: HeaderMap,
 }
 impl ApiConnection {
     /// Use tenant_id, client_id and secret_key to request a bearer token and store it in
     /// our headers. Must be called once before requesting any content.
     pub async fn login(&mut self) -> Result<()> {
-        info!("Logging in to Office Management API.");
-        let auth_url = format!("https://login.microsoftonline.com/{}/oauth2/token",
-                               self.args.tenant_id.to_string());
+        info!("Logging in to Office Management API for tenant {}.", self.tenant.tenant_id);
 
-        let resource = "https://manage.office.com";
+        let (login_endpoint, resource_endpoint) = self.tenant.get_endpoints();
+        let auth_url = format!("{}/{}/oauth2/token", login_endpoint, self.tenant.tenant_id);
+
+        let secret = self.tenant.get_secret().map_err(|e| anyhow!(e))?;
+        let client_id = &self.tenant.client_id;
 
         let params = [
             ("grant_type", "client_credentials"),
-            ("client_id", &self.args.client_id),
-            ("client_secret", &self.args.secret_key),
-            ("resource", &resource)];
+            ("client_id", client_id.as_str()),
+            ("client_secret", secret.as_str()),
+            ("resource", resource_endpoint.as_str())];
 
         self.headers.insert(CONTENT_TYPE, "application/x-www-form-urlencoded".parse().unwrap());
 
@@ -74,7 +78,8 @@ impl ApiConnection {
     }
 
     fn get_base_url(&self) -> String {
-        format!("https://manage.office.com/api/v1.0/{}/activity/feed", self.args.tenant_id)
+        let (_, resource_endpoint) = self.tenant.get_endpoints();
+        format!("{}/api/v1.0/{}/activity/feed", resource_endpoint, self.tenant.tenant_id)
     }
 
     pub async fn get_feeds(&self) -> Result<Vec<String>> {
@@ -123,7 +128,7 @@ impl ApiConnection {
     pub async fn subscribe_to_feeds(&self) -> Result<()> {
 
         info!("Subscribing to audit feeds.");
-        let mut content_types = self.config.collect.content_types.get_content_type_strings();
+        let mut content_types = self.config.get_subscriptions();
 
         let client = reqwest::Client::new();
         info!("Getting current audit feed subscriptions.");
@@ -176,7 +181,9 @@ impl ApiConnection {
     pub fn create_base_urls(&self, runs: HashMap<String, Vec<(String, String)>>) -> Vec<(String, String)> {
 
         let mut urls_to_get: Vec<(String, String)> = Vec::new();
-        let content_to_get = self.config.collect.content_types.get_content_type_strings();
+        let content_to_get = self.config.get_subscriptions();
+        let publisher_id = self.args.publisher_id.clone();
+
         for content_type in content_to_get {
             let content_runs = runs.get(&content_type).unwrap();
             for content_run in content_runs.into_iter() {
@@ -189,7 +196,7 @@ impl ApiConnection {
                              content_type,
                              start_time,
                              end_time,
-                             self.args.publisher_id)
+                             publisher_id)
                     ));
             }
         }
@@ -397,6 +404,7 @@ pub async fn get_content(config: GetContentConfig, content_rx: Receiver<ContentT
         let result_tx = config.result_tx.clone();
         let status_tx = config.status_tx.clone();
         let content_error_tx = config.content_error_tx.clone();
+        let max_size = config.max_response_size;
         async move {
             match client.get(content_to_retrieve.url.clone())
                 .timeout(Duration::from_secs(3))
@@ -405,7 +413,7 @@ pub async fn get_content(config: GetContentConfig, content_rx: Receiver<ContentT
                 .await {
                 Ok(resp) => {
                     handle_content_response(resp, result_tx, status_tx, content_error_tx,
-                    content_to_retrieve).await;
+                    content_to_retrieve, max_size).await;
                 },
                 Err(_) => {
                     handle_content_response_error(status_tx, content_error_tx, content_to_retrieve)
@@ -422,7 +430,7 @@ pub async fn get_content(config: GetContentConfig, content_rx: Receiver<ContentT
 async fn handle_content_response(
     resp: reqwest::Response, mut result_tx: Sender<(String, ContentToRetrieve)>,
     mut status_tx: Sender<StatusMessage>, mut content_error_tx: Sender<ContentToRetrieve>,
-    content_to_retrieve: ContentToRetrieve) {
+    content_to_retrieve: ContentToRetrieve, max_response_size: Option<usize>) {
 
     if !resp.status().is_success() {
         match content_error_tx.send(content_to_retrieve).await {
@@ -437,13 +445,34 @@ async fn handle_content_response(
             if text.to_lowercase().contains("too many request") {
                 match status_tx.send(StatusMessage::BeingThrottled).await {
                     Err(e) => {
-                        error!("Could not send status message: {}", e);
+                        error!("Could not send status message: {}", e)
+;
                     },
                     _=> (),
                 }
             }
         }
         return
+    }
+
+    // Check content length to prevent memory exhaustion
+    // Default limit: 10MB if not configured
+    const DEFAULT_MAX_SIZE: usize = 10 * 1024 * 1024;
+    let max_size = max_response_size.unwrap_or(DEFAULT_MAX_SIZE);
+
+    if let Some(content_length) = resp.content_length() {
+        if content_length > max_size as u64 {
+            warn!("Response too large: {} bytes (max {}), skipping", content_length, max_size);
+            match content_error_tx.send(content_to_retrieve).await {
+                Err(_) => {
+                    status_tx.send(StatusMessage::ErrorContentBlob).await.unwrap_or_else(
+                        |e| panic!("Could not send status update, channel closed?: {}", e)
+                    );
+                },
+                _=> (),
+            }
+            return;
+        }
     }
 
     match resp.text().await {

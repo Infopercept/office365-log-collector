@@ -1,0 +1,53 @@
+# Office365 Audit Log Collector - Example Configuration
+# Copy this file to config.yaml and fill in your credentials
+
+enabled: true
+
+# Daemon mode: Run continuously with specified interval
+# Formats: "30s", "5m", "1h", "1d"
+interval: "5m"
+
+# Skip historical logs (only collect new events from NOW)
+# Set to false to collect last 24 hours on first run
+only_future_events: true
+
+# Directory for state files and known_blobs
+workingDir: "/var/lib/office365-collector"
+
+# Your Office365 tenant(s)
+tenants:
+  - tenant_id: "YOUR-TENANT-ID"
+    client_id: "YOUR-CLIENT-ID"
+    client_secret: "YOUR-CLIENT-SECRET"
+    api_type: "commercial"  # Options: commercial, gcc, gcc-high
+
+# Subscriptions to collect
+subscriptions:
+  - "Audit.AzureActiveDirectory"
+  - "Audit.Exchange"
+  - "Audit.SharePoint"
+  - "Audit.General"
+  - "DLP.All"
+
+# Output configuration (choose one or more)
+output:
+  # Option 1: Fluentd forward protocol
+  fluentd:
+    tenantName: "YourOrg"
+    address: "localhost"
+    port: 24224
+
+  # Option 2: JSON file output
+  # file:
+  #   path: "/var/logs/office365/audit.json"
+  #   separateByContentType: true
+
+  # Option 3: Graylog GELF
+  # graylog:
+  #   address: "graylog.example.com"
+  #   port: 12201
+
+# Logging configuration
+log:
+  path: ""        # Empty = stdout (for systemd/docker)
+  debug: false    # Set to true for troubleshooting
