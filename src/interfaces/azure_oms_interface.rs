@@ -50,81 +50,106 @@ impl OmsInterface {
     }
 }
 
+/// MEMORY FIX: Process logs in chunks to avoid creating all tasks upfront.
+/// Previously, all logs were collected into a Vec before streaming, causing
+/// memory spikes when flushing large caches (500k logs = ~500MB in task allocations).
+const OMS_CHUNK_SIZE: usize = 1000;
+
 #[async_trait]
 impl Interface for OmsInterface {
 
     async fn send_logs(&mut self, logs: Caches) {
         let client = reqwest::Client::new();
 
-        info!("Sending logs to OMS interface.");
-        let mut requests = Vec::new();
-        for (content_type, content_logs) in logs.get_all_types() {
-            for log in content_logs.iter() {
-                let table_name = content_type.replace('.', "_");
-                let body = serde_json::to_string(log).unwrap();
-                let content_length = body.len();
-
-                let time_value = if let Some(i) = log.get("CreationTime") {
-                    i.as_str().unwrap().to_string()
-                } else {
-                    warn!("Expected CreationTime field, skipping log");
-                    continue
-                };
-                requests.push((body.clone(), table_name.clone(), time_value.clone(),
-                               content_length));
-            }
-        }
-
         let resource = "/api/logs";
         let uri = format!("https://{}.ods.opinsights.azure.com{}?api-version=2016-04-01",
                           self.config.output.oms.as_ref().unwrap().workspace_id, resource);
 
-        info!("URL for OMS calls will be: {}", uri);
-        let calls = stream::iter(requests)
-            .map(|(body, table_name, time_value, content_length)| {
-                let client = client.clone();
-                let uri = uri.clone();
-                let method = "POST".to_string();
-                let content_type = "application/json".to_string();
-                let rfc1123date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(); 
-                let signature = self.build_signature(rfc1123date.clone(), content_length,
-                                                     method.clone(), content_type.clone(),
-                                                     resource.to_string());
+        info!("Sending logs to OMS interface (chunked streaming).");
 
-                tokio::spawn(async move {
-                    let result = client
-                        .post(uri)
-                        .header("content-type", "application/json")
-                        .header("content-length", content_length)
-                        .header("Authorization", signature)
-                        .header("Log-Type", table_name)
-                        .header("x-ms-date", rfc1123date.clone())
-                        .header("time-generated-field", time_value)
-                        .body(body)
-                        .send()
-                        .await;
-                    match result {
-                        Ok(response) => {
-                            if !response.status().is_success() {
-                                match response.text().await {
-                                    Ok(text) => error!("Error response after sending log to OMS: {}", text),
-                                    Err(e) => error!("Error response after sending log to OMS, but could not parse response: {}", e),
+        // Process logs in chunks to avoid memory spikes
+        for (content_type, content_logs) in logs.get_all_types() {
+            if content_logs.is_empty() {
+                continue;
+            }
+
+            info!("Sending {} {} logs to OMS in chunks of {}", content_logs.len(), content_type, OMS_CHUNK_SIZE);
+
+            // Process in chunks
+            for chunk in content_logs.chunks(OMS_CHUNK_SIZE) {
+                let mut chunk_requests = Vec::with_capacity(chunk.len());
+
+                for log in chunk.iter() {
+                    let table_name = content_type.replace('.', "_");
+                    let body = match serde_json::to_string(log) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("Failed to serialize log: {}", e);
+                            continue;
+                        }
+                    };
+                    let content_length = body.len();
+
+                    let time_value = if let Some(i) = log.get("CreationTime") {
+                        i.as_str().unwrap_or_default().to_string()
+                    } else {
+                        warn!("Expected CreationTime field, skipping log");
+                        continue;
+                    };
+
+                    chunk_requests.push((body, table_name, time_value, content_length));
+                }
+
+                // Stream this chunk with bounded concurrency
+                let calls = stream::iter(chunk_requests)
+                    .map(|(body, table_name, time_value, content_length)| {
+                        let client = client.clone();
+                        let uri = uri.clone();
+                        let method = "POST".to_string();
+                        let content_type_header = "application/json".to_string();
+                        let rfc1123date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                        let signature = self.build_signature(
+                            rfc1123date.clone(),
+                            content_length,
+                            method,
+                            content_type_header,
+                            resource.to_string()
+                        );
+
+                        async move {
+                            let result = client
+                                .post(&uri)
+                                .header("content-type", "application/json")
+                                .header("content-length", content_length)
+                                .header("Authorization", signature)
+                                .header("Log-Type", table_name)
+                                .header("x-ms-date", rfc1123date)
+                                .header("time-generated-field", time_value)
+                                .body(body)
+                                .send()
+                                .await;
+
+                            match result {
+                                Ok(response) => {
+                                    if !response.status().is_success() {
+                                        match response.text().await {
+                                            Ok(text) => error!("Error response after sending log to OMS: {}", text),
+                                            Err(e) => error!("Error response after sending log to OMS, could not parse: {}", e),
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Error sending log to OMS: {}", e);
                                 }
                             }
-                        },
-                        Err(e) => {
-                            error!("Error send log to OMS: {}", e);
                         }
-                    }
-                })
-            })
-            .buffer_unordered(10);
+                    })
+                    .buffer_unordered(10);
 
-        calls.for_each(|call| async {
-            match call {
-                Ok(_) => (),
-                Err(e) => warn!("Issue sending log to workspace: {}", e),
+                calls.for_each(|_| async {}).await;
             }
-        }).await;
+        }
+
+        info!("Finished sending logs to OMS");
     }
 }

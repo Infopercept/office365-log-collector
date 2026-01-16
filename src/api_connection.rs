@@ -3,7 +3,6 @@ use std::time::Duration;
 use reqwest;
 use log::{debug, warn, error, info};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
-use tokio;
 use serde_json;
 use futures::{SinkExt, StreamExt};
 use futures::channel::mpsc::{Receiver, Sender};
@@ -210,8 +209,10 @@ impl ApiConnection {
 /// next page of content. This is sent over the blobs_tx channel to retrieve as well. If no
 /// additional pages exist, a status message is sent to indicate all content blobs for this
 /// content type have been retrieved.
-#[tokio::main(flavor="multi_thread", worker_threads=20)]
-pub async fn get_content_blobs(config: GetBlobConfig, blobs_rx: Receiver<(String, String)>,
+///
+/// MEMORY FIX: Async version that runs on shared runtime instead of creating its own.
+/// The original function created 20 worker threads for each tenant collection.
+pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(String, String)>,
                                known_blobs: HashMap<String, String>) {
 
     blobs_rx.for_each_concurrent(config.threads, |(content_type, url)| {
@@ -395,8 +396,10 @@ async fn handle_blob_response_error(
 
 
 /// Retrieve the actual ContentUris found in the JSON body of content blobs.
-#[tokio::main(flavor="multi_thread", worker_threads=50)]
-pub async fn get_content(config: GetContentConfig, content_rx: Receiver<ContentToRetrieve>) {
+///
+/// MEMORY FIX: Async version that runs on shared runtime instead of creating its own.
+/// The original function created 50 worker threads for each tenant collection.
+pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<ContentToRetrieve>) {
 
     content_rx.for_each_concurrent(config.threads, |content_to_retrieve| {
         let client = config.client.clone();

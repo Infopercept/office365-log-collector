@@ -19,6 +19,7 @@ mod interfaces;
 // mod interactive_mode;
 mod state;
 mod recordtype_filter;
+mod known_blobs_cache;
 
 
 #[tokio::main]

@@ -1,12 +1,12 @@
-use std::thread;
 use std::collections::HashMap;
 use std::mem::swap;
 use std::ops::Div;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Result;
-use log::{warn, error, info, debug};
-use futures::{SinkExt};
+use log::{warn, error, info};
+use futures::SinkExt;
 use futures::channel::mpsc::channel;
 use futures::channel::mpsc::{Sender, Receiver};
 use serde_json::Value;
@@ -25,6 +25,7 @@ use crate::interfaces::file_interface::FileInterface;
 use crate::interfaces::fluentd_interface::FluentdInterface;
 use crate::interfaces::graylog_interface::GraylogInterface;
 use crate::interfaces::interactive_interface::InteractiveInterface;
+use crate::known_blobs_cache::{KnownBlobsCache, SharedKnownBlobsCache};
 
 
 /// # Office Audit Log Collector
@@ -42,7 +43,7 @@ pub struct Collector {
     result_rx: Receiver<(String, ContentToRetrieve)>,
     stats_rx: Receiver<(usize, usize, usize, usize)>,
     kill_tx: tokio::sync::mpsc::Sender<bool>,
-    known_blobs: HashMap<String, String>,
+    known_blobs: SharedKnownBlobsCache,  // Memory-efficient LRU cache
     saved: usize,
     cache: Caches,
     filters: HashMap<String, ArbitraryJson>,
@@ -83,7 +84,12 @@ impl Collector {
         let api = api_connection::get_api_connection(args.clone(), config.clone(), tenant).await?;
         api.subscribe_to_feeds().await?;
 
-        let known_blobs = config.load_known_blobs();
+        // Load known blobs using memory-efficient LRU cache
+        let working_dir = config.get_working_dir();
+        let known_blobs_path = Path::new(&working_dir).join("known_blobs");
+        let known_blobs_cache = KnownBlobsCache::load_from_file(&known_blobs_path);
+        info!("Loaded {} known blobs into LRU cache", known_blobs_cache.len());
+        let known_blobs = SharedKnownBlobsCache::from_cache(known_blobs_cache);
 
         // Get content types/subscriptions - convert dynamic subscriptions to ContentTypesSubConfig
         let content_types_config = if let Some(ref collect) = config.collect {
@@ -105,8 +111,8 @@ impl Collector {
                                   content_types_config,
                                   runs.clone(),
                                   &config,
-                                  known_blobs.clone(),
-                                  state);
+                                  known_blobs.clone(),  // Clones the Arc, not the data
+                                  state).await;
 
         // Initialize collector
         let cache_size = if let Some(ref collect) = config.collect {
@@ -167,11 +173,18 @@ impl Collector {
             self.check_results().await;
         }
         self.check_all_results().await;
-        self.end_run();
+        self.end_run().await;
     }
 
-    pub fn end_run(&mut self) {
-        self.config.save_known_blobs(&self.known_blobs);
+    pub async fn end_run(&mut self) {
+        // Save known blobs using memory-efficient cache
+        let working_dir = self.config.get_working_dir();
+        let known_blobs_path = Path::new(&working_dir).join("known_blobs");
+        if let Err(e) = self.known_blobs.save_to_file(&known_blobs_path).await {
+            error!("Failed to save known blobs: {}", e);
+        } else {
+            info!("Saved {} known blobs to file", self.known_blobs.len().await);
+        }
 
         // Update state with current time for only_future_events
         if self.config.only_future_events.unwrap_or(false) {
@@ -213,7 +226,9 @@ impl Collector {
     }
 
     async fn handle_content(&mut self, msg: String, content: ContentToRetrieve) -> usize {
-        self.known_blobs.insert(content.content_id.clone(), content.expiration.clone());
+        // Insert into memory-efficient LRU cache with TTL
+        self.known_blobs.insert(content.content_id.clone(), &content.expiration).await;
+
         if let Ok(logs) = serde_json::from_str::<JsonList>(&msg) {
             let amount = logs.len();
             for log in logs {
@@ -402,11 +417,15 @@ fn initialize_channels(
 
 /// Get all the available log content for a list of content types and runs (start- and end times
 /// of content to receive).
-fn get_available_content(api: ApiConnection,
+///
+/// MEMORY FIX: Now runs all collectors as async tasks on the existing runtime instead of
+/// spawning separate threads with their own #[tokio::main] runtimes. This eliminates
+/// the 70+ worker threads that were being created per tenant per collection.
+async fn get_available_content(api: ApiConnection,
                          content_types: ContentTypesSubConfig,
                          runs: HashMap<String, Vec<(String, String)>>,
                          config: &Config,
-                         known_blobs: HashMap<String, String>,
+                         known_blobs: SharedKnownBlobsCache,
                          state: Arc<Mutex<RunState>>)
                          -> (Receiver<(String, ContentToRetrieve)>,
                              Receiver<(usize, usize, usize, usize)>,
@@ -433,21 +452,42 @@ fn get_available_content(api: ApiConnection,
 }
 
 
-/// Spawn threads running the actual collectors, and a message loop thread to keep track of
-/// progress and terminate once finished.
+/// Spawn async tasks for collectors on the existing Tokio runtime.
+///
+/// MEMORY FIX: Previously spawned 3 OS threads, each with their own #[tokio::main] runtime
+/// creating 20+50+default worker threads (70+ total). Now uses tokio::spawn to run as
+/// lightweight async tasks on the existing runtime, drastically reducing memory and thread overhead.
 fn spawn_blob_collector(
     blob_config: data_structures::GetBlobConfig,
     content_config: data_structures::GetContentConfig,
     message_loop_config: data_structures::MessageLoopConfig,
     blobs_rx: Receiver<(String, String)>,
     content_rx: Receiver<ContentToRetrieve>,
-    known_blobs: HashMap<String, String>,
+    known_blobs: SharedKnownBlobsCache,
     state: Arc<Mutex<RunState>>) {
 
-    info!("Spawned collector threads");
-    thread::spawn( move || {api_connection::get_content_blobs(blob_config, blobs_rx, known_blobs);});
-    thread::spawn( move || {api_connection::get_content(content_config, content_rx);});
-    thread::spawn(move || {message_loop(message_loop_config, state)});
+    info!("Spawning collector tasks on shared runtime");
+
+    // Convert known_blobs to HashMap for compatibility with existing blob checking
+    // The async task will use this for checking, but the main cache handles insertions
+    let known_blobs_snapshot = tokio::task::block_in_place(|| {
+        futures::executor::block_on(known_blobs.to_hashmap())
+    });
+
+    // Spawn blob collector as async task
+    tokio::spawn(async move {
+        api_connection::get_content_blobs_async(blob_config, blobs_rx, known_blobs_snapshot).await;
+    });
+
+    // Spawn content collector as async task
+    tokio::spawn(async move {
+        api_connection::get_content_async(content_config, content_rx).await;
+    });
+
+    // Spawn message loop as async task
+    tokio::spawn(async move {
+        message_loop(message_loop_config, state).await;
+    });
 }
 
 
@@ -455,7 +495,10 @@ fn spawn_blob_collector(
 /// retrying any failed content or dropping it after too many retries. Every time content is foudn
 /// awaiting_content_blobs is incremented; every time content is retrieved or could not be
 /// retrieved awaiting_content_blobs is decremented. When it reaches 0 we know we are done.
-#[tokio::main]
+///
+/// MEMORY FIX: Removed #[tokio::main] - now runs as an async task on the shared runtime
+/// instead of creating its own runtime with additional worker threads.
+/// Also added bounded retry_map to prevent unbounded memory growth on persistent failures.
 pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                           mut state: Arc<Mutex<RunState>>) {
 
@@ -466,7 +509,14 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
     }
 
     let mut rate_limit_backoff_started: Option<Instant> = None;
-    let mut retry_map = HashMap::new();
+
+    // MEMORY FIX: Use bounded LRU cache for retry tracking to prevent unbounded growth
+    // on persistent failures. Max 50,000 entries should be more than enough for any
+    // reasonable collection run.
+    const MAX_RETRY_ENTRIES: usize = 50_000;
+    let mut retry_map: lru::LruCache<String, usize> =
+        lru::LruCache::new(std::num::NonZeroUsize::new(MAX_RETRY_ENTRIES).unwrap());
+
     // Loop ends with the run itself, signalling the program is done.
     loop {
 
@@ -541,23 +591,23 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
         // Check channel for content pages that could not be retrieved and retry them the user
         // defined amount of times. If we can't in that amount of times then give up.
         if let Ok(Some((content_type, url))) = config.blob_error_rx.try_next() {
-            if retry_map.contains_key(&url) {
-                let retries_left = retry_map.get_mut(&url).unwrap();
-                if retries_left == &mut 0 {
+            if let Some(retries_left) = retry_map.get_mut(&url) {
+                if *retries_left == 0 {
                     error!("Gave up on blob {}", url);
+                    retry_map.pop(&url); // Clean up exhausted entry
                     state.lock().await.awaiting_content_types -= 1;
                     state.lock().await.stats.blobs_error += 1;
                 } else {
                     if rate_limit_backoff_started.is_none() {
                         *retries_left -= 1;
                     }
+                    let retries = *retries_left;
                     state.lock().await.stats.blobs_retried += 1;
-                    warn!("Retry blob {} {}", retries_left, url);
+                    warn!("Retry blob {} {}", retries, url);
                     config.blobs_tx.send((content_type, url)).await.unwrap();
-
                 }
-            }  else {
-                retry_map.insert(url.clone(), config.retries - 1);
+            } else {
+                retry_map.put(url.clone(), config.retries - 1);
                 state.lock().await.stats.blobs_retried += 1;
                 warn!("Retry blob {} {}", config.retries - 1, url);
                 config.blobs_tx.send((content_type, url)).await.unwrap();
@@ -567,21 +617,22 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
         // defined amount of times. If we can't in that amount of times then give up.
         if let Ok(Some(content)) = config.content_error_rx.try_next() {
             state.lock().await.stats.blobs_retried += 1;
-            if retry_map.contains_key(&content.url) {
-                let retries_left = retry_map.get_mut(&content.url).unwrap();
-                if retries_left == &mut 0 {
+            if let Some(retries_left) = retry_map.get_mut(&content.url) {
+                if *retries_left == 0 {
                     error!("Gave up on content {}", content.url);
+                    retry_map.pop(&content.url); // Clean up exhausted entry
                     state.lock().await.awaiting_content_blobs -= 1;
                     state.lock().await.stats.blobs_error += 1;
                 } else {
                     if rate_limit_backoff_started.is_none() {
                         *retries_left -= 1;
                     }
-                    warn!("Retry content {} {}", retries_left, content.url);
+                    let retries = *retries_left;
+                    warn!("Retry content {} {}", retries, content.url);
                     config.content_tx.send(content).await.unwrap();
                 }
-            }  else {
-                retry_map.insert(content.url.to_string(), config.retries - 1);
+            } else {
+                retry_map.put(content.url.to_string(), config.retries - 1);
                 state.lock().await.stats.blobs_retried += 1;
                 warn!("Retry content {} {}", config.retries - 1, content.url);
                 config.content_tx.send(content).await.unwrap();
