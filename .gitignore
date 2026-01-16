@@ -86,3 +86,7 @@ output/
 
 # Fluentd local config
 fluentd/
+
+# Local release builds
+release-v*/
+release-*.tar.gz
