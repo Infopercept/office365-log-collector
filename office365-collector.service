@@ -1,17 +1,26 @@
 [Unit]
 Description=Office365 Audit Log Collector
+Documentation=https://github.com/therajvira/office365-log-collector
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/new-siem/office365-audit-log-collector
-ExecStart=/home/ubuntu/new-siem/office365-audit-log-collector/target/release/office_audit_log_collector --config /home/ubuntu/new-siem/office365-audit-log-collector/config/config.yaml
+Group=ubuntu
+WorkingDirectory=/var/lib/office365-collector
+ExecStart=/usr/local/bin/office_audit_log_collector --config /etc/office365-collector/config.yaml
 Restart=always
 RestartSec=10
 LimitNOFILE=65535
 
-# Logging
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/office365-collector /var/log/office365
+
+# Logging (use journalctl -u office365-collector to view)
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=office365-collector
