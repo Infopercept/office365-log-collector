@@ -7,6 +7,9 @@ interval: "5m"  # Collection interval: "5m", "10m", "1h", etc.
 # Only collect NEW events (don't fetch historical data on startup)
 only_future_events: true
 
+# Directory for state files
+workingDir: "/var/lib/office365-collector"
+
 # Your Office365 credentials
 tenants:
   - tenant_id: "YOUR-TENANT-ID"
@@ -16,34 +19,35 @@ tenants:
 
 # Subscribe to all 5 main feeds
 subscriptions:
-  - "DLP.All"
+  - "Audit.AzureActiveDirectory"
   - "Audit.Exchange"
   - "Audit.SharePoint"
-  - "Audit.AzureActiveDirectory"
   - "Audit.General"
+  - "DLP.All"
 
-# PRODUCTION: Send to Fluentd (recommended)
+# PRODUCTION: File output (Recommended - low memory, works with any log shipper)
 output:
-  fluentd:
-    enabled: true
-    tenantName: "MyCompany"
-    address: "localhost"  # or "fluentd" if using Docker
-    port: 24224
+  file:
+    path: "/var/log/office365/audit.json"
+    separateByContentType: true  # Creates 5 separate files by content type
 
-  # ALTERNATIVE: File output (for testing or backup)
-  # file:
-  #   path: "output/office365-audit.json"
-  #   separateByContentType: true  # Creates 5 separate files
+  # ALTERNATIVE: Fluentd output (if you need Fluentd specifically)
+  # fluentd:
+  #   tenantName: "MyCompany"
+  #   address: "localhost"  # or "fluentd" if using Docker
+  #   port: 24224
+
+  # ALTERNATIVE: Graylog output
+  # graylog:
+  #   address: "graylog.example.com"
+  #   port: 12201
 
 log:
-  path: "/var/log/office365-collector.log"
+  path: ""  # Empty = stdout (for journalctl)
   debug: false
 
-# Advanced settings
-collect:
-  workingDir: "/var/lib/office365-collector"
-  cacheSize: 500000
-  maxThreads: 50
-  retries: 3
-  skipKnownLogs: true  # Skip already-collected logs
-  hoursToCollect: 24   # Look back 24 hours for new data
+# Optional: Advanced performance tuning
+# collect:
+#   cacheSize: 500000   # LRU cache size for deduplication
+#   maxThreads: 50      # Parallel download threads
+#   retries: 3          # API retry attempts

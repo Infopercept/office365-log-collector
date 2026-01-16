@@ -389,7 +389,6 @@ pub struct FluentdOutputSubConfig {
     pub port: u16,
 }
 
-
 #[derive(Deserialize, Clone, Debug)]
 pub struct OmsOutputSubConfig {
     #[serde(rename = "workspaceId")]

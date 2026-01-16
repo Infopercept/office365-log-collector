@@ -31,21 +31,26 @@ subscriptions:
 
 # Output configuration (choose one or more)
 output:
-  # Option 1: Fluentd forward protocol
-  fluentd:
-    tenantName: "YourOrg"
-    address: "localhost"
-    port: 24224
+  # Option 1: JSON file output (Recommended - works with any log shipper)
+  file:
+    path: "/var/log/office365/audit.json"
+    separateByContentType: true  # Creates separate files per content type
 
-  # Option 2: JSON file output
-  # file:
-  #   path: "/var/logs/office365/audit.json"
-  #   separateByContentType: true
+  # Option 2: Fluentd forward protocol
+  # fluentd:
+  #   tenantName: "YourOrg"
+  #   address: "localhost"
+  #   port: 24224
 
   # Option 3: Graylog GELF
   # graylog:
   #   address: "graylog.example.com"
   #   port: 12201
+
+  # Option 4: Azure Log Analytics
+  # azureLogAnalytics:
+  #   workspaceId: "YOUR-WORKSPACE-ID"
+  # Note: Also requires --oms-key command line argument
 
 # Logging configuration
 log:
