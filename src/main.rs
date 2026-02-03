@@ -2,9 +2,9 @@ use std::sync::Arc;
 use clap::Parser;
 use chrono::{DateTime, Utc};
 use crate::collector::Collector;
-use crate::config::Config;
+use crate::config::{Config, MAX_LOOKBACK_HOURS};
 use crate::state::StateManager;
-use log::{error, info, LevelFilter};
+use log::{error, info, warn, LevelFilter};
 use tokio::sync::Mutex;
 use crate::data_structures::RunState;
 // Interactive mode is disabled - not updated for multi-tenant
@@ -113,6 +113,10 @@ async fn run_collection_for_all_tenants(args: data_structures::CliArgs, config: 
 /// Get start time from state if only_future_events is enabled
 /// Returns Some(time) to start collection from that time
 /// Returns None to use default (last 24 hours)
+///
+/// SAFETY: If state is stale (older than Microsoft's 7-day retention window),
+/// this function will log a warning and return a capped time. The actual capping
+/// is done in config.rs:get_needed_runs_from() for consistency.
 fn get_start_time_from_state(config: &Config, tenant_id: &str) -> Option<DateTime<Utc>> {
     // Only use state-based start time if only_future_events is enabled
     if !config.only_future_events.unwrap_or(false) {
@@ -126,8 +130,24 @@ fn get_start_time_from_state(config: &Config, tenant_id: &str) -> Option<DateTim
     let subscriptions = config.get_subscriptions();
     if let Some(first_sub) = subscriptions.first() {
         if let Some(state) = state_manager.load_state(tenant_id, first_sub) {
-            info!("Using last_log_time {} as start time for tenant {} (only_future_events=true)",
-                state.last_log_time, tenant_id);
+            let now = Utc::now();
+            let hours_since_last_run = (now - state.last_log_time).num_hours();
+
+            // Log warning if state is stale (older than retention window)
+            if hours_since_last_run > MAX_LOOKBACK_HOURS {
+                warn!(
+                    "State for tenant {} is stale: last_log_time is {} ({} hours ago). \
+                     Microsoft only retains audit logs for 7 days (~168 hours). \
+                     Collection will be capped to {} hours lookback. \
+                     Some audit events may have been permanently lost.",
+                    tenant_id, state.last_log_time, hours_since_last_run, MAX_LOOKBACK_HOURS
+                );
+            } else {
+                info!("Using last_log_time {} as start time for tenant {} (only_future_events=true, {} hours ago)",
+                    state.last_log_time, tenant_id, hours_since_last_run);
+            }
+
+            // Return the state time - get_needed_runs_from() will cap it if needed
             return Some(state.last_log_time);
         } else {
             // First run - initialize state and start collection from 1 second ago

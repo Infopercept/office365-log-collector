@@ -4,8 +4,14 @@ use std::fs::File;
 use std::io::{BufReader, LineWriter, Read, Write};
 use std::path::Path;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use log::warn;
 use serde_derive::Deserialize;
 use crate::data_structures::ArbitraryJson;
+
+/// Microsoft Office 365 Management API retains audit logs for 7 days.
+/// Any attempt to fetch logs older than this will return empty results or errors.
+/// We use 6 days 23 hours as a safe maximum to avoid edge cases.
+pub const MAX_LOOKBACK_HOURS: i64 = 167;  // 6 days 23 hours
 
 
 #[derive(Deserialize, Clone, Debug)]
@@ -115,13 +121,32 @@ impl Config {
 
     /// Get needed runs with optional start time override (for only_future_events)
     /// If start_from is provided, use it as the start time instead of NOW - hours_to_collect
+    ///
+    /// SAFETY: This function enforces Microsoft's 7-day retention limit. If the provided
+    /// start_from time is older than MAX_LOOKBACK_HOURS, it will be capped to prevent
+    /// futile API requests for expired data.
     pub fn get_needed_runs_from(&self, start_from: Option<DateTime<Utc>>) -> HashMap<String, Vec<(String, String)>> {
         let mut runs: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let end_time = chrono::Utc::now();
 
+        // Calculate the maximum allowed lookback time (7 days minus 1 hour for safety)
+        let max_lookback_time = end_time - chrono::Duration::try_hours(MAX_LOOKBACK_HOURS).unwrap();
+
         let start_time_base = if let Some(from) = start_from {
-            // Use provided start time (from state's last_log_time)
-            from
+            // Check if the provided start time is older than the retention window
+            if from < max_lookback_time {
+                let hours_old = (end_time - from).num_hours();
+                warn!(
+                    "State file has stale last_log_time ({} hours old). \
+                     Microsoft only retains audit logs for 7 days. \
+                     Capping start time to {} hours ago to avoid futile API requests.",
+                    hours_old, MAX_LOOKBACK_HOURS
+                );
+                max_lookback_time
+            } else {
+                // Use provided start time (from state's last_log_time)
+                from
+            }
         } else {
             // Fall back to hours_to_collect calculation
             let hours_to_collect = if let Some(ref collect) = self.collect {

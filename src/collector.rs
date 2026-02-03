@@ -148,21 +148,35 @@ impl Collector {
 
     /// Monitor all started content retrieval threads, processing results and terminating
     /// when all content has been retrieved (signalled by a final run stats message).
+    ///
+    /// SAFETY: Has a default 30-minute maximum timeout to prevent infinite hangs.
+    /// This can be overridden with the globalTimeout config option.
     pub async fn monitor(&mut self) {
 
         let start = Instant::now();
+        // Default timeout of 30 minutes if not configured - prevents infinite hangs
+        const DEFAULT_TIMEOUT_MINUTES: usize = 30;
+
         loop {
-            let timeout = if let Some(ref collect) = self.config.collect {
-                collect.global_timeout
+            let timeout_minutes = if let Some(ref collect) = self.config.collect {
+                collect.global_timeout.unwrap_or(DEFAULT_TIMEOUT_MINUTES)
             } else {
-                None
+                DEFAULT_TIMEOUT_MINUTES
             };
-            if let Some(timeout) = timeout {
-                if timeout > 0 && start.elapsed().as_secs().div(60) as usize >= timeout {
-                    warn!("Global timeout expired, request collector stop.");
-                    self.kill_tx.blocking_send(true).unwrap();
-                }
+
+            let elapsed_minutes = start.elapsed().as_secs().div(60) as usize;
+            if timeout_minutes > 0 && elapsed_minutes >= timeout_minutes {
+                warn!(
+                    "Global timeout expired after {} minutes. Requesting collector stop. \
+                     This may indicate stale state files or API issues.",
+                    elapsed_minutes
+                );
+                let _ = self.kill_tx.send(true).await;
+                // Give message loop time to process kill signal
+                sleep(Duration::from_secs(2)).await;
+                break;
             }
+
             // Run stats are only returned when all content has been retrieved,
             // therefore this signals the end of the run.
             if self.check_stats().await {
@@ -171,6 +185,9 @@ impl Collector {
 
             // Check if a log came in.
             self.check_results().await;
+
+            // Small yield to prevent CPU spinning
+            sleep(Duration::from_millis(10)).await;
         }
         self.check_all_results().await;
         self.end_run().await;
