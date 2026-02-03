@@ -1,6 +1,6 @@
 [package]
 name = "office_audit_log_collector"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Raj Vira", "ddbnl (original)"]
