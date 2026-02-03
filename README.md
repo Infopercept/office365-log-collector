@@ -343,8 +343,14 @@ collect:
 
 ## License
 
-See LICENSE.md
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
 
 ## Credits
 
-Originally created by [ddbnl](https://github.com/ddbnl). Rust rewrite and ongoing maintenance.
+- [Raj Vira](https://github.com/therajvira) - Production-ready Rust implementation
+- [ddbnl](https://github.com/ddbnl) - Original concept and implementation

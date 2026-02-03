@@ -2,6 +2,12 @@
 name = "office_audit_log_collector"
 version = "2.6.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Raj Vira", "ddbnl (original)"]
+description = "High-performance Office 365 audit log collector for SIEM integration"
+repository = "https://github.com/therajvira/office365-log-collector"
+keywords = ["office365", "audit", "siem", "security", "logging"]
+categories = ["command-line-utilities", "network-programming"]
 
 
 [dependencies]
