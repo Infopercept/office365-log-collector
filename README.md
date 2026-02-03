@@ -8,7 +8,7 @@ A high-performance, production-ready Rust application that collects audit logs f
 
 ### Download Pre-built Binary
 
-Download the latest release for your platform from the [Releases](https://github.com/ddbnl/office365-audit-log-collector/releases) page:
+Download the latest release for your platform from the [Releases](https://github.com/therajvira/office365-log-collector/releases) page:
 
 - **Linux x86_64**: `office_audit_log_collector-linux-x86_64`
 - **Linux ARM64**: `office_audit_log_collector-linux-arm64`
@@ -19,7 +19,7 @@ Download the latest release for your platform from the [Releases](https://github
 
 ```bash
 # 1. Download binary
-wget https://github.com/ddbnl/office365-audit-log-collector/releases/latest/download/office_audit_log_collector-linux-x86_64
+wget https://github.com/therajvira/office365-log-collector/releases/latest/download/office_audit_log_collector-linux-x86_64
 chmod +x office_audit_log_collector-linux-x86_64
 sudo mv office_audit_log_collector-linux-x86_64 /usr/local/bin/office_audit_log_collector
 
@@ -284,7 +284,7 @@ docker run -d \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   -v office365-state:/var/lib/office365-collector \
   -v office365-logs:/var/log/office365 \
-  ghcr.io/ddbnl/office365-audit-log-collector:latest
+  ghcr.io/therajvira/office365-log-collector:latest
 ```
 
 ---
@@ -296,8 +296,8 @@ docker run -d \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/ddbnl/office365-audit-log-collector.git
-cd office365-audit-log-collector
+git clone https://github.com/therajvira/office365-log-collector.git
+cd office365-log-collector
 cargo build --release
 
 # Binary at: ./target/release/office_audit_log_collector
