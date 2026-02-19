@@ -1,0 +1,26 @@
+enabled: true
+only_future_events: false
+
+tenants:
+  - tenant_id: "YOUR-TENANT-ID-HERE"
+    client_id: "YOUR-CLIENT-ID-HERE"
+    client_secret: "YOUR-CLIENT-SECRET-HERE"
+    api_type: "commercial"
+
+# Subscribe to all 5 main subscription types
+subscriptions:
+  - "DLP.All"
+  - "Audit.Exchange"
+  - "Audit.SharePoint"
+  - "Audit.AzureActiveDirectory"
+  - "Audit.General"
+
+# Output to separate JSON files - one per subscription
+output:
+  file:
+    path: "office365-audit.json"
+    separateByContentType: true  # This creates separate files!
+
+log:
+  path: ""
+  debug: false

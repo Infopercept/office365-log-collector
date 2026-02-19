@@ -71,6 +71,7 @@ config/office365-creds
 config/config.production.yaml
 config/config-test.yaml
 config/config-file-test.yaml
+config/config-multi-subscription.yaml
 
 # State files
 office365-*.json
