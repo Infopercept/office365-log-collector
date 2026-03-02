@@ -9,6 +9,7 @@ use futures::channel::mpsc::{Receiver, Sender};
 use crate::config::Config;
 use crate::data_structures::{JsonList, StatusMessage, GetBlobConfig, GetContentConfig, AuthResult,
                              ContentToRetrieve, CliArgs};
+use crate::known_blobs_cache::SharedKnownBlobsCache;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
@@ -212,8 +213,12 @@ impl ApiConnection {
 ///
 /// MEMORY FIX: Async version that runs on shared runtime instead of creating its own.
 /// The original function created 20 worker threads for each tenant collection.
+///
+/// MEMORY FIX 2: Now accepts SharedKnownBlobsCache (Arc-wrapped) instead of HashMap.
+/// Previously, the entire known_blobs HashMap was cloned for each concurrent task
+/// (N clones × ~1.5MB each). Now only the Arc refcount is incremented per clone.
 pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(String, String)>,
-                               known_blobs: HashMap<String, String>) {
+                               known_blobs: SharedKnownBlobsCache) {
 
     blobs_rx.for_each_concurrent(config.threads, |(content_type, url)| {
 
@@ -225,7 +230,7 @@ pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(
         let headers = config.headers.clone();
         let content_type = content_type.clone();
         let url = url.clone();
-        let known_blobs = known_blobs.clone();
+        let known_blobs = known_blobs.clone(); // Arc clone — just a refcount increment
         let duplicate = config.duplicate;
         async move {
             match client
@@ -265,7 +270,7 @@ async fn handle_blob_response(
     resp: reqwest::Response, blobs_tx: Sender<(String, String)>,
     mut status_tx: Sender<StatusMessage>, content_tx: Sender<ContentToRetrieve>,
     mut blob_error_tx: Sender<(String, String)>, content_type: String, url: String,
-    known_blobs: &HashMap<String, String>, duplicate: usize) {
+    known_blobs: &SharedKnownBlobsCache, duplicate: usize) {
 
     handle_blob_response_paging(&resp, blobs_tx, status_tx.clone(), content_type.clone()).await;
 
@@ -335,7 +340,7 @@ async fn handle_blob_response_paging(
 /// over the content_tx channel for the content thread to retrieve.
 async fn handle_blob_response_content_uris(
     mut status_tx: Sender<StatusMessage>, mut content_tx: Sender<ContentToRetrieve>,
-    content_type: String, content_json: JsonList, known_blobs: &HashMap<String, String>,
+    content_type: String, content_json: JsonList, known_blobs: &SharedKnownBlobsCache,
     duplicate: usize) {
 
     for json_dict in content_json.into_iter() {
@@ -346,7 +351,7 @@ async fn handle_blob_response_content_uris(
                 .to_string()
                 .strip_prefix('"').unwrap().strip_suffix('"').unwrap()
                 .to_string();
-            if known_blobs.contains_key(&content_id) {
+            if known_blobs.contains(&content_id).await {
                 continue
             }
             let url = json_dict
@@ -430,8 +435,15 @@ pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<Co
 
 
 /// Deal with successful content request response.
+///
+/// MEMORY FIX: Uses streaming body reader with size enforcement instead of resp.text().await.
+/// Previously, resp.text() downloaded the entire body into memory before returning, and the
+/// Content-Length check only worked when the header was present (chunked transfers bypassed it).
+/// Now we use resp.chunk() to stream the body incrementally and abort if it exceeds the limit.
+/// This protects against both known-size and chunked-transfer memory bombs.
+/// No data loss: oversized responses are sent to the error channel for retry/drop via existing logic.
 async fn handle_content_response(
-    resp: reqwest::Response, mut result_tx: Sender<(String, ContentToRetrieve)>,
+    mut resp: reqwest::Response, mut result_tx: Sender<(String, ContentToRetrieve)>,
     mut status_tx: Sender<StatusMessage>, mut content_error_tx: Sender<ContentToRetrieve>,
     content_to_retrieve: ContentToRetrieve, max_response_size: Option<usize>) {
 
@@ -448,8 +460,7 @@ async fn handle_content_response(
             if text.to_lowercase().contains("too many request") {
                 match status_tx.send(StatusMessage::BeingThrottled).await {
                     Err(e) => {
-                        error!("Could not send status message: {}", e)
-;
+                        error!("Could not send status message: {}", e);
                     },
                     _=> (),
                 }
@@ -458,14 +469,17 @@ async fn handle_content_response(
         return
     }
 
-    // Check content length to prevent memory exhaustion
-    // Default limit: 10MB if not configured
+    // Enforce maximum response size to prevent memory exhaustion.
+    // Default limit: 10MB. Applies regardless of whether Content-Length is present,
+    // protecting against chunked transfers that could be arbitrarily large.
     const DEFAULT_MAX_SIZE: usize = 10 * 1024 * 1024;
     let max_size = max_response_size.unwrap_or(DEFAULT_MAX_SIZE);
 
+    // Fast-path rejection via Content-Length header (avoids downloading the body at all)
     if let Some(content_length) = resp.content_length() {
         if content_length > max_size as u64 {
-            warn!("Response too large: {} bytes (max {}), skipping", content_length, max_size);
+            warn!("Response too large: {} bytes (max {}), skipping content {}",
+                  content_length, max_size, content_to_retrieve.content_id);
             match content_error_tx.send(content_to_retrieve).await {
                 Err(_) => {
                     status_tx.send(StatusMessage::ErrorContentBlob).await.unwrap_or_else(
@@ -478,25 +492,57 @@ async fn handle_content_response(
         }
     }
 
-    match resp.text().await {
-        Ok(json) => {
-            result_tx.send((json, content_to_retrieve)).await.unwrap_or_else(
-                |e| panic!("Could not send status update, channel closed?: {}", e)
-            );
-            status_tx.send(StatusMessage::RetrievedContentBlob).await.unwrap();
-        }
-        Err(e) => {
-            warn!("Error interpreting JSON: {}", e);
-            match content_error_tx.send(content_to_retrieve).await {
-                Err(_) => {
-                    status_tx.send(StatusMessage::ErrorContentBlob).await.unwrap_or_else(
-                        |e| panic!("Could not send status update, channel closed?: {}", e)
-                    );
-                },
-                _=> (),
+    // Stream the response body chunk-by-chunk with size enforcement.
+    // Pre-allocate based on Content-Length hint if available, capped at max_size.
+    let initial_capacity = resp.content_length()
+        .map(|cl| (cl as usize).min(max_size))
+        .unwrap_or(64 * 1024); // 64KB default
+    let mut body = Vec::with_capacity(initial_capacity);
+
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if body.len() > max_size {
+                    warn!("Response body exceeds {} byte limit while streaming, dropping content {}",
+                          max_size, content_to_retrieve.content_id);
+                    match content_error_tx.send(content_to_retrieve).await {
+                        Err(_) => {
+                            status_tx.send(StatusMessage::ErrorContentBlob).await.unwrap_or_else(
+                                |e| panic!("Could not send status update, channel closed?: {}", e)
+                            );
+                        },
+                        _ => (),
+                    }
+                    return;
+                }
+            }
+            Ok(None) => break, // Body complete
+            Err(e) => {
+                warn!("Error reading response body for content {}: {}", content_to_retrieve.content_id, e);
+                match content_error_tx.send(content_to_retrieve).await {
+                    Err(_) => {
+                        status_tx.send(StatusMessage::ErrorContentBlob).await.unwrap_or_else(
+                            |e| panic!("Could not send status update, channel closed?: {}", e)
+                        );
+                    },
+                    _ => (),
+                }
+                return;
             }
         }
     }
+
+    // Convert body to UTF-8 string. from_utf8_lossy handles any invalid sequences
+    // gracefully (replaces with U+FFFD) rather than failing the entire download.
+    let json = String::from_utf8_lossy(&body).into_owned();
+    // Explicitly free the Vec now that we have the String
+    drop(body);
+
+    result_tx.send((json, content_to_retrieve)).await.unwrap_or_else(
+        |e| panic!("Could not send result, channel closed?: {}", e)
+    );
+    status_tx.send(StatusMessage::RetrievedContentBlob).await.unwrap();
 }
 
 

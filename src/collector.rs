@@ -115,10 +115,15 @@ impl Collector {
                                   state).await;
 
         // Initialize collector
+        // MEMORY FIX: Default cache_size reduced from 500,000 to 5,000.
+        // The cache buffers parsed log entries before flushing to output interfaces.
+        // At ~3KB per entry, 500K entries = ~1.5GB before flush. 5K entries = ~15MB.
+        // Flushing more frequently is cheap (appending to JSONL files) and prevents
+        // memory accumulation. Zero data loss: logs are flushed sooner, not dropped.
         let cache_size = if let Some(ref collect) = config.collect {
-            collect.cache_size.unwrap_or(500000)
+            collect.cache_size.unwrap_or(5000)
         } else {
-            500000
+            5000
         };
         let cache = Caches::new(cache_size);
         let filters = if let Some(ref collect) = config.collect {
@@ -352,40 +357,53 @@ fn initialize_channels(
     let urls = api.create_base_urls(runs);
 
     // Create channels to communicate with async closures
+    //
+    // MEMORY FIX: Channel capacities reduced to prevent excessive in-flight memory.
+    // - result_tx (500): Each item holds a full JSON response body (~100KB-10MB).
+    //   At 10,000 capacity, worst case was ~1GB in the channel alone. 500 items
+    //   provides ~5s of buffer at 100 items/sec consumption. Producers block (backpressure)
+    //   when full — no data loss, just pacing.
+    // - Other channels (2000): Hold small structs (URLs, status enums, ContentToRetrieve).
+    //   2000 is generous for coordination messages.
     let (status_tx, status_rx):
         (Sender<data_structures::StatusMessage>,
-         Receiver<data_structures::StatusMessage>) = channel(10000);
+         Receiver<data_structures::StatusMessage>) = channel(2000);
 
     let (blobs_tx, blobs_rx):
         (Sender<(String, String)>,
-         Receiver<(String, String)>) = channel(10000);
+         Receiver<(String, String)>) = channel(2000);
 
     let (blob_error_tx, blob_error_rx):
         (Sender<(String, String)>,
-         Receiver<(String, String)>) = channel(10000);
+         Receiver<(String, String)>) = channel(2000);
 
     let (content_tx, content_rx):
         (Sender<ContentToRetrieve>,
-         Receiver<ContentToRetrieve>) = channel(10000);
+         Receiver<ContentToRetrieve>) = channel(2000);
 
     let (content_error_tx, content_error_rx):
         (Sender<ContentToRetrieve>,
-         Receiver<ContentToRetrieve>) = channel(10000);
+         Receiver<ContentToRetrieve>) = channel(2000);
 
     let (result_tx, result_rx):
         (Sender<(String, ContentToRetrieve)>,
-         Receiver<(String, ContentToRetrieve)>) = channel(10000);
+         Receiver<(String, ContentToRetrieve)>) = channel(500);
 
     let (stats_tx, stats_rx):
         (Sender<(usize, usize, usize, usize)>,
-         Receiver<(usize, usize, usize, usize)>) = channel(10000);
+         Receiver<(usize, usize, usize, usize)>) = channel(100);
 
     let (kill_tx, kill_rx): (tokio::sync::mpsc::Sender<bool>,
-                             tokio::sync::mpsc::Receiver<bool>) = tokio::sync::mpsc::channel(1000);
+                             tokio::sync::mpsc::Receiver<bool>) = tokio::sync::mpsc::channel(10);
 
+    // MEMORY FIX: Default concurrent downloads reduced from 50 to 10.
+    // Each concurrent download holds an entire response body in memory (~1-10MB)
+    // plus the deserialized JSON (~3-5x expansion). At 50 threads, peak memory for
+    // in-flight downloads alone was ~300MB-3GB. At 10 threads, peak is ~60-300MB.
+    // No data loss: downloads are simply paced, not dropped.
     let max_threads = config.collect.as_ref()
         .and_then(|c| c.max_threads)
-        .unwrap_or(50);
+        .unwrap_or(10);
     let duplicate = config.collect.as_ref()
         .and_then(|c| c.duplicate)
         .unwrap_or(1);
@@ -485,15 +503,14 @@ fn spawn_blob_collector(
 
     info!("Spawning collector tasks on shared runtime");
 
-    // Convert known_blobs to HashMap for compatibility with existing blob checking
-    // The async task will use this for checking, but the main cache handles insertions
-    let known_blobs_snapshot = tokio::task::block_in_place(|| {
-        futures::executor::block_on(known_blobs.to_hashmap())
-    });
-
-    // Spawn blob collector as async task
+    // MEMORY FIX: Pass the SharedKnownBlobsCache directly instead of cloning to HashMap.
+    // Previously, to_hashmap() materialized the entire LRU cache (~8000 entries) into a
+    // plain HashMap, and then each concurrent blob task cloned that HashMap again
+    // (50 clones × ~1.5MB each = ~75MB). Now we pass the Arc-wrapped cache directly;
+    // cloning just increments the Arc refcount. The live cache also means newly-discovered
+    // blobs are immediately visible for dedup, which is strictly more correct.
     tokio::spawn(async move {
-        api_connection::get_content_blobs_async(blob_config, blobs_rx, known_blobs_snapshot).await;
+        api_connection::get_content_blobs_async(blob_config, blobs_rx, known_blobs).await;
     });
 
     // Spawn content collector as async task

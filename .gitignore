@@ -91,3 +91,6 @@ fluentd/
 # Local release builds
 release-v*/
 release-*.tar.gz
+
+# Cargo local config/cache
+.cargo/

@@ -21,6 +21,16 @@ mod state;
 mod recordtype_filter;
 mod known_blobs_cache;
 
+// Use jemalloc as the global allocator. Unlike glibc malloc, jemalloc actively
+// returns freed pages to the OS, preventing the RSS ratchet effect where memory
+// grows monotonically to the container limit and triggers OOMKill.
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 
 #[tokio::main]
 async fn main() {
