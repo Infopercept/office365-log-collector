@@ -40,3 +40,4 @@ lru = "0.12"  # Memory-efficient LRU cache for known_blobs
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

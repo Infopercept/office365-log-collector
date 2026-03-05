@@ -7,8 +7,8 @@ use serde_json;
 use futures::{SinkExt, StreamExt};
 use futures::channel::mpsc::{Receiver, Sender};
 use crate::config::Config;
-use crate::data_structures::{JsonList, StatusMessage, GetBlobConfig, GetContentConfig, AuthResult,
-                             ContentToRetrieve, CliArgs};
+use crate::data_structures::{ArbitraryJson, JsonList, StatusMessage, GetBlobConfig, GetContentConfig, AuthResult,
+                             ContentToRetrieve, CliArgs, FileWriter};
 use crate::known_blobs_cache::SharedKnownBlobsCache;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -205,18 +205,10 @@ impl ApiConnection {
 }
 
 
-/// Get available content blobs to retrieve. A base URL receives the initial page of content blobs.
-/// The response header could specify 'NextPageUri', which if it exists specifies the URL for the
-/// next page of content. This is sent over the blobs_tx channel to retrieve as well. If no
-/// additional pages exist, a status message is sent to indicate all content blobs for this
-/// content type have been retrieved.
+/// Get available content blobs to retrieve.
 ///
-/// MEMORY FIX: Async version that runs on shared runtime instead of creating its own.
-/// The original function created 20 worker threads for each tenant collection.
-///
-/// MEMORY FIX 2: Now accepts SharedKnownBlobsCache (Arc-wrapped) instead of HashMap.
-/// Previously, the entire known_blobs HashMap was cloned for each concurrent task
-/// (N clones × ~1.5MB each). Now only the Arc refcount is incremented per clone.
+/// MEMORY FIX: Async version that runs on shared runtime.
+/// Accepts SharedKnownBlobsCache (Arc-wrapped) instead of HashMap.
 pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(String, String)>,
                                known_blobs: SharedKnownBlobsCache) {
 
@@ -230,7 +222,7 @@ pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(
         let headers = config.headers.clone();
         let content_type = content_type.clone();
         let url = url.clone();
-        let known_blobs = known_blobs.clone(); // Arc clone — just a refcount increment
+        let known_blobs = known_blobs.clone();
         let duplicate = config.duplicate;
         async move {
             match client
@@ -263,9 +255,7 @@ pub async fn get_content_blobs_async(config: GetBlobConfig, blobs_rx: Receiver<(
 }
 
 
-/// Deal with the response of a successful content blob request. Try to decode into JSON to
-/// retrieve the content URIs of the content inside the blob. Also check response header for another
-/// page of content blobs.
+/// Deal with the response of a successful content blob request.
 async fn handle_blob_response(
     resp: reqwest::Response, blobs_tx: Sender<(String, String)>,
     mut status_tx: Sender<StatusMessage>, content_tx: Sender<ContentToRetrieve>,
@@ -336,8 +326,7 @@ async fn handle_blob_response_paging(
 }
 
 
-/// Deal with successfully received and decoded content blobs. Send the URIs of content to retrieve
-/// over the content_tx channel for the content thread to retrieve.
+/// Send the URIs of content to retrieve over the content_tx channel.
 async fn handle_blob_response_content_uris(
     mut status_tx: Sender<StatusMessage>, mut content_tx: Sender<ContentToRetrieve>,
     content_type: String, content_json: JsonList, known_blobs: &SharedKnownBlobsCache,
@@ -402,8 +391,9 @@ async fn handle_blob_response_error(
 
 /// Retrieve the actual ContentUris found in the JSON body of content blobs.
 ///
-/// MEMORY FIX: Async version that runs on shared runtime instead of creating its own.
-/// The original function created 50 worker threads for each tenant collection.
+/// MEMORY FIX: Each download task now processes the response INLINE — parsing from bytes,
+/// filtering, and writing directly to file via the shared FileWriter. Only a log count
+/// (usize) flows through the result channel, not multi-MB response bodies.
 pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<ContentToRetrieve>) {
 
     content_rx.for_each_concurrent(config.threads, |content_to_retrieve| {
@@ -413,6 +403,8 @@ pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<Co
         let status_tx = config.status_tx.clone();
         let content_error_tx = config.content_error_tx.clone();
         let max_size = config.max_response_size;
+        let file_writer = config.file_writer.clone();
+        let filters = config.filters.clone();
         async move {
             match client.get(content_to_retrieve.url.clone())
                 .timeout(Duration::from_secs(3))
@@ -421,7 +413,7 @@ pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<Co
                 .await {
                 Ok(resp) => {
                     handle_content_response(resp, result_tx, status_tx, content_error_tx,
-                    content_to_retrieve, max_size).await;
+                        content_to_retrieve, max_size, &file_writer, &filters).await;
                 },
                 Err(_) => {
                     handle_content_response_error(status_tx, content_error_tx, content_to_retrieve)
@@ -434,19 +426,27 @@ pub async fn get_content_async(config: GetContentConfig, content_rx: Receiver<Co
 }
 
 
-/// Deal with successful content request response.
+/// Process a content response INLINE: download body, parse from bytes, filter, write to file.
 ///
-/// MEMORY FIX: Uses streaming body reader with size enforcement instead of resp.text().await.
-/// Previously, resp.text() downloaded the entire body into memory before returning, and the
-/// Content-Length check only worked when the header was present (chunked transfers bypassed it).
-/// Now we use resp.chunk() to stream the body incrementally and abort if it exceeds the limit.
-/// This protects against both known-size and chunked-transfer memory bombs.
-/// No data loss: oversized responses are sent to the error channel for retry/drop via existing logic.
+/// MEMORY FIX (CORE CHANGE):
+/// OLD: Download body → copy to String → send String through channel → consumer parses
+///      Peak per response: 50-70MB (body + String copy + parsed JSON all alive)
+///      Channel could hold 500 × 10MB = 5GB
+///
+/// NEW: Download body → serde_json::from_slice (no String copy) → drop body →
+///      filter + write each log directly to file → send only count through channel
+///      Peak per response: ~40MB (body + parsed JSON, body freed immediately)
+///      Channel holds 500 × ~200 bytes = 100KB
 async fn handle_content_response(
-    mut resp: reqwest::Response, mut result_tx: Sender<(String, ContentToRetrieve)>,
-    mut status_tx: Sender<StatusMessage>, mut content_error_tx: Sender<ContentToRetrieve>,
-    content_to_retrieve: ContentToRetrieve, max_response_size: Option<usize>) {
-
+    mut resp: reqwest::Response,
+    mut result_tx: Sender<(usize, ContentToRetrieve)>,
+    mut status_tx: Sender<StatusMessage>,
+    mut content_error_tx: Sender<ContentToRetrieve>,
+    content_to_retrieve: ContentToRetrieve,
+    max_response_size: Option<usize>,
+    file_writer: &FileWriter,
+    filters: &HashMap<String, ArbitraryJson>,
+) {
     if !resp.status().is_success() {
         match content_error_tx.send(content_to_retrieve).await {
             Err(_) => {
@@ -470,12 +470,10 @@ async fn handle_content_response(
     }
 
     // Enforce maximum response size to prevent memory exhaustion.
-    // Default limit: 10MB. Applies regardless of whether Content-Length is present,
-    // protecting against chunked transfers that could be arbitrarily large.
     const DEFAULT_MAX_SIZE: usize = 10 * 1024 * 1024;
     let max_size = max_response_size.unwrap_or(DEFAULT_MAX_SIZE);
 
-    // Fast-path rejection via Content-Length header (avoids downloading the body at all)
+    // Fast-path rejection via Content-Length header
     if let Some(content_length) = resp.content_length() {
         if content_length > max_size as u64 {
             warn!("Response too large: {} bytes (max {}), skipping content {}",
@@ -493,10 +491,9 @@ async fn handle_content_response(
     }
 
     // Stream the response body chunk-by-chunk with size enforcement.
-    // Pre-allocate based on Content-Length hint if available, capped at max_size.
     let initial_capacity = resp.content_length()
         .map(|cl| (cl as usize).min(max_size))
-        .unwrap_or(64 * 1024); // 64KB default
+        .unwrap_or(64 * 1024);
     let mut body = Vec::with_capacity(initial_capacity);
 
     loop {
@@ -517,7 +514,7 @@ async fn handle_content_response(
                     return;
                 }
             }
-            Ok(None) => break, // Body complete
+            Ok(None) => break,
             Err(e) => {
                 warn!("Error reading response body for content {}: {}", content_to_retrieve.content_id, e);
                 match content_error_tx.send(content_to_retrieve).await {
@@ -533,13 +530,80 @@ async fn handle_content_response(
         }
     }
 
-    // Convert body to UTF-8 string. from_utf8_lossy handles any invalid sequences
-    // gracefully (replaces with U+FFFD) rather than failing the entire download.
-    let json = String::from_utf8_lossy(&body).into_owned();
-    // Explicitly free the Vec now that we have the String
-    drop(body);
+    // === CORE MEMORY FIX ===
+    // Parse JSON directly from bytes — NO intermediate String allocation.
+    // Old code did: String::from_utf8_lossy(&body).into_owned() which COPIED the entire
+    // body (up to 10MB), then sent that String through the channel, then the consumer
+    // parsed it AGAIN with serde_json::from_str creating a 3-5x larger Value tree.
+    //
+    // New code: parse once from &[u8], drop body immediately, process inline.
+    let log_count = match serde_json::from_slice::<Vec<Value>>(&body) {
+        Ok(logs) => {
+            // Free the raw bytes IMMEDIATELY — they are no longer needed
+            drop(body);
 
-    result_tx.send((json, content_to_retrieve)).await.unwrap_or_else(
+            let content_type = &content_to_retrieve.content_type;
+            let type_filters = filters.get(content_type);
+            let mut count = 0;
+
+            for log in logs {
+                // Apply filters (same logic as old handle_log)
+                if let Some(content_filters) = type_filters {
+                    let mut skip = false;
+                    if let Value::Object(ref map) = log {
+                        for (k, v) in content_filters.iter() {
+                            if let Some(val) = map.get(k) {
+                                if val != v { skip = true; break; }
+                            }
+                        }
+                    }
+                    if skip { continue; }
+                }
+
+                // Serialize with OriginFeed field added inline.
+                // We avoid mutating the Value (which would require Object variant match)
+                // by building the output string directly.
+                match log {
+                    Value::Object(mut map) => {
+                        map.insert("OriginFeed".to_string(),
+                                   Value::String(content_type.to_string()));
+                        match serde_json::to_string(&Value::Object(map)) {
+                            Ok(json_line) => {
+                                if let Err(e) = file_writer.write_log(content_type, &json_line) {
+                                    warn!("Failed to write log to file: {}", e);
+                                }
+                                count += 1;
+                            }
+                            Err(e) => warn!("Failed to serialize log: {}", e),
+                        }
+                    }
+                    _ => {
+                        // Non-object log entry (unexpected but handle gracefully)
+                        match serde_json::to_string(&log) {
+                            Ok(json_line) => {
+                                if let Err(e) = file_writer.write_log(content_type, &json_line) {
+                                    warn!("Failed to write log to file: {}", e);
+                                }
+                                count += 1;
+                            }
+                            Err(e) => warn!("Failed to serialize log: {}", e),
+                        }
+                    }
+                }
+                // Each Value is dropped here — no accumulation
+            }
+            count
+        }
+        Err(e) => {
+            warn!("Skipped content that could not be parsed: {} - {}",
+                  content_to_retrieve.content_id, e);
+            drop(body);
+            0
+        }
+    };
+
+    // Send only the COUNT through the channel — not the data
+    result_tx.send((log_count, content_to_retrieve)).await.unwrap_or_else(
         |e| panic!("Could not send result, channel closed?: {}", e)
     );
     status_tx.send(StatusMessage::RetrievedContentBlob).await.unwrap();

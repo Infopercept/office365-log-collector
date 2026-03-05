@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "office_audit_log_collector"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -931,6 +931,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "simple-logging",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
@@ -1591,6 +1592,17 @@ checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
 dependencies = [
  "cfg-if",
  "once_cell",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

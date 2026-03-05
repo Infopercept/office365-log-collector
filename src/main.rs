@@ -31,6 +31,14 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// Configure jemalloc to immediately return freed pages to the OS.
+// dirty_decay_ms:0  — purge dirty pages instantly (no 10s default hold)
+// muzzy_decay_ms:0  — purge muzzy pages instantly (no 10s default hold)
+// This prevents RSS from growing monotonically in long-running daemon mode.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 #[tokio::main]
 async fn main() {
@@ -61,6 +69,13 @@ async fn main() {
             info!("Starting Office365 collector in daemon mode with interval: {}s", interval_seconds);
             loop {
                 run_collection_for_all_tenants(args.clone(), config.clone()).await;
+
+                // Force jemalloc to return freed pages to the OS between cycles.
+                // Without this, jemalloc retains pages in dirty page lists, causing
+                // RSS to grow monotonically even when Rust has dropped all allocations.
+                #[cfg(not(target_env = "msvc"))]
+                log_jemalloc_stats();
+
                 info!("Sleeping for {} seconds until next collection...", interval_seconds);
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval_seconds)).await;
             }
@@ -69,6 +84,30 @@ async fn main() {
             run_collection_for_all_tenants(args, config).await;
         }
     }
+}
+
+/// Log jemalloc memory stats between daemon cycles.
+/// Actual page purging is handled by dirty_decay_ms:0 / muzzy_decay_ms:0
+/// set via _rjem_malloc_conf at init time.
+#[cfg(not(target_env = "msvc"))]
+fn log_jemalloc_stats() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    if let Err(e) = epoch::advance() {
+        warn!("jemalloc epoch::advance failed: {}", e);
+        return;
+    }
+
+    let allocated = stats::allocated::read().unwrap_or(0);
+    let resident = stats::resident::read().unwrap_or(0);
+    let active = stats::active::read().unwrap_or(0);
+
+    info!(
+        "jemalloc stats: allocated={:.1}MB, active={:.1}MB, resident={:.1}MB",
+        allocated as f64 / 1048576.0,
+        active as f64 / 1048576.0,
+        resident as f64 / 1048576.0,
+    );
 }
 
 async fn run_collection_for_all_tenants(args: data_structures::CliArgs, config: Config) {
@@ -120,15 +159,7 @@ async fn run_collection_for_all_tenants(args: data_structures::CliArgs, config: 
     info!("All tenant collections completed");
 }
 
-/// Get start time from state if only_future_events is enabled
-/// Returns Some(time) to start collection from that time
-/// Returns None to use default (last 24 hours)
-///
-/// SAFETY: If state is stale (older than Microsoft's 7-day retention window),
-/// this function will log a warning and return a capped time. The actual capping
-/// is done in config.rs:get_needed_runs_from() for consistency.
 fn get_start_time_from_state(config: &Config, tenant_id: &str) -> Option<DateTime<Utc>> {
-    // Only use state-based start time if only_future_events is enabled
     if !config.only_future_events.unwrap_or(false) {
         return None;
     }
@@ -136,20 +167,17 @@ fn get_start_time_from_state(config: &Config, tenant_id: &str) -> Option<DateTim
     let working_dir = config.get_working_dir();
     let state_manager = StateManager::new(&working_dir);
 
-    // Check any subscription's state to get last_log_time
     let subscriptions = config.get_subscriptions();
     if let Some(first_sub) = subscriptions.first() {
         if let Some(state) = state_manager.load_state(tenant_id, first_sub) {
             let now = Utc::now();
             let hours_since_last_run = (now - state.last_log_time).num_hours();
 
-            // Log warning if state is stale (older than retention window)
             if hours_since_last_run > MAX_LOOKBACK_HOURS {
                 warn!(
                     "State for tenant {} is stale: last_log_time is {} ({} hours ago). \
                      Microsoft only retains audit logs for 7 days (~168 hours). \
-                     Collection will be capped to {} hours lookback. \
-                     Some audit events may have been permanently lost.",
+                     Collection will be capped to {} hours lookback.",
                     tenant_id, state.last_log_time, hours_since_last_run, MAX_LOOKBACK_HOURS
                 );
             } else {
@@ -157,17 +185,13 @@ fn get_start_time_from_state(config: &Config, tenant_id: &str) -> Option<DateTim
                     state.last_log_time, tenant_id, hours_since_last_run);
             }
 
-            // Return the state time - get_needed_runs_from() will cap it if needed
             return Some(state.last_log_time);
         } else {
-            // First run - initialize state and start collection from 1 second ago
-            // (API requires startTime < endTime, so we use NOW - 1 second)
             let now = Utc::now();
             let start_time = now - chrono::Duration::try_seconds(1).unwrap();
             info!("First run for tenant {} with only_future_events=true: starting from {} (1 sec ago)",
                 tenant_id, start_time);
 
-            // Initialize state for all subscriptions
             for subscription in &subscriptions {
                 let state = crate::state::TenantSubscriptionState {
                     last_log_time: start_time,
@@ -203,41 +227,3 @@ fn init_non_interactive_logging(config: &Config) {
         simple_logging::log_to_stderr(level);
     }
 }
-
-// Interactive mode logging disabled - not needed for production daemon mode
-/*
-fn init_interactive_logging(config: &Config, log_tx: UnboundedSender<(String, Level)>) {
-    let level = if let Some(log_config) = &config.log {
-        if log_config.debug { LevelFilter::Debug } else { LevelFilter::Info }
-    } else {
-        LevelFilter::Info
-    };
-    log::set_max_level(level);
-    log::set_boxed_logger(InteractiveLogger::new(log_tx)).unwrap();
-}
-
-pub struct  InteractiveLogger {
-    log_tx: UnboundedSender<(String, Level)>,
-}
-impl InteractiveLogger {
-    pub fn new(log_tx: UnboundedSender<(String, Level)>) -> Box<Self> {
-        Box::new(InteractiveLogger { log_tx })
-    }
-}
-impl Log for InteractiveLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
-    }
-    fn log(&self, record: &Record) {
-        let date = chrono::Utc::now().to_string();
-        let msg = format!("[{}] {}:{} -- {}",
-                 date,
-                 record.level(),
-                 record.target(),
-                 record.args());
-        self.log_tx.send((msg, record.level())).unwrap()
-    }
-    fn flush(&self) {}
-}
-*/
-

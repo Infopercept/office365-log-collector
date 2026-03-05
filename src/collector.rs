@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::mem::swap;
 use std::ops::Div;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +8,6 @@ use log::{warn, error, info};
 use futures::SinkExt;
 use futures::channel::mpsc::channel;
 use futures::channel::mpsc::{Sender, Receiver};
-use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -17,36 +15,31 @@ use crate::data_structures;
 use crate::api_connection;
 use crate::api_connection::ApiConnection;
 use crate::config::{Config, ContentTypesSubConfig};
-use crate::data_structures::{ArbitraryJson, Caches, CliArgs, ContentToRetrieve, JsonList, RunState};
+use crate::data_structures::{ArbitraryJson, CliArgs, ContentToRetrieve, FileWriter, RunState};
 use crate::state::StateManager;
-use crate::interfaces::azure_oms_interface::OmsInterface;
-use crate::interfaces::interface::Interface;
-use crate::interfaces::file_interface::FileInterface;
-use crate::interfaces::fluentd_interface::FluentdInterface;
-use crate::interfaces::graylog_interface::GraylogInterface;
-use crate::interfaces::interactive_interface::InteractiveInterface;
 use crate::known_blobs_cache::{KnownBlobsCache, SharedKnownBlobsCache};
 
 
 /// # Office Audit Log Collector
-/// Will start three background threads responsible for retrieving content:
-/// - blob_thread: find content blobs and send results to content channel
-/// - content_thread: retrieve content blobs from content channel, send results to results channel
-/// - message_loop_thread: keep track of progress, terminate after all content is retrieved
-/// Found blobs (which contain logs) are sent to the main thread, which will check filters and known
-/// logs to determine whether it must be saved. If it must be saved, it is forwarded to active
-/// interfaces. Active interfaces are determined by the config file passed in by the user.
+///
+/// MEMORY FIX: The collector no longer buffers response bodies in channels or caches.
+/// Download tasks process responses inline: parse from bytes → filter → write to file.
+/// The monitor loop only receives log counts and updates known_blobs for dedup.
+///
+/// TASK LIFECYCLE FIX: Spawned background tasks are tracked and aborted on cleanup.
+/// Without this, the blob collector task hangs forever (self-referential channel)
+/// and leaks ~42MB per cycle.
 pub struct Collector {
     config: Config,
     tenant_id: String,
-    interfaces: Vec<Box<dyn Interface + Send>>,
-    result_rx: Receiver<(String, ContentToRetrieve)>,
+    result_rx: Receiver<(usize, ContentToRetrieve)>,
     stats_rx: Receiver<(usize, usize, usize, usize)>,
     kill_tx: tokio::sync::mpsc::Sender<bool>,
-    known_blobs: SharedKnownBlobsCache,  // Memory-efficient LRU cache
+    known_blobs: SharedKnownBlobsCache,
     saved: usize,
-    cache: Caches,
-    filters: HashMap<String, ArbitraryJson>,
+    file_writer: Arc<FileWriter>,
+    /// Handles to spawned background tasks. Must be aborted on cleanup to prevent leaks.
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Collector {
@@ -56,28 +49,10 @@ impl Collector {
                      tenant: crate::config::TenantConfig,
                      runs: HashMap<String, Vec<(String, String)>>,
                      state: Arc<Mutex<RunState>>,
-                     interactive_sender: Option<UnboundedSender<Vec<String>>>
+                     _interactive_sender: Option<UnboundedSender<Vec<String>>>
     ) -> Result<Collector> {
 
         info!("Initializing collector for tenant {}.", tenant.tenant_id);
-
-        // Initialize interfaces
-        let mut interfaces: Vec<Box<dyn Interface + Send>> = Vec::new();
-        if args.interactive {
-            interfaces.push(Box::new(InteractiveInterface::new(interactive_sender.unwrap())));
-        }
-        if config.output.file.is_some() {
-            interfaces.push(Box::new(FileInterface::new(config.clone())));
-        }
-        if config.output.fluentd.is_some() {
-            interfaces.push(Box::new(FluentdInterface::new(config.clone())));
-        }
-        if config.output.graylog.is_some() {
-            interfaces.push(Box::new(GraylogInterface::new(config.clone())));
-        }
-        if config.output.oms.is_some() {
-            interfaces.push(Box::new(OmsInterface::new(config.clone(), args.oms_key.clone())));
-        }
 
         // Initialize collector threads
         let tenant_id = tenant.tenant_id.clone();
@@ -91,11 +66,10 @@ impl Collector {
         info!("Loaded {} known blobs into LRU cache", known_blobs_cache.len());
         let known_blobs = SharedKnownBlobsCache::from_cache(known_blobs_cache);
 
-        // Get content types/subscriptions - convert dynamic subscriptions to ContentTypesSubConfig
+        // Get content types/subscriptions
         let content_types_config = if let Some(ref collect) = config.collect {
             collect.content_types
         } else {
-            // Convert Vec<String> subscriptions to ContentTypesSubConfig
             let subs = config.get_subscriptions();
             ContentTypesSubConfig {
                 general: Some(subs.contains(&"Audit.General".to_string())),
@@ -106,28 +80,24 @@ impl Collector {
             }
         };
 
-        let (result_rx, stats_rx, kill_tx) =
-            get_available_content(api,
-                                  content_types_config,
-                                  runs.clone(),
-                                  &config,
-                                  known_blobs.clone(),  // Clones the Arc, not the data
-                                  state).await;
-
-        // Initialize collector
-        // MEMORY FIX: Default cache_size reduced from 500,000 to 5,000.
-        // The cache buffers parsed log entries before flushing to output interfaces.
-        // At ~3KB per entry, 500K entries = ~1.5GB before flush. 5K entries = ~15MB.
-        // Flushing more frequently is cheap (appending to JSONL files) and prevents
-        // memory accumulation. Zero data loss: logs are flushed sooner, not dropped.
-        let cache_size = if let Some(ref collect) = config.collect {
-            collect.cache_size.unwrap_or(5000)
+        // Create the shared FileWriter for direct-to-disk writing
+        let file_writer = if let Some(ref file_config) = config.output.file {
+            if file_config.separate_by_content_type.unwrap_or(false) {
+                let paths = FileWriter::build_separated_paths(
+                    &file_config.path,
+                    &config.get_subscriptions(),
+                );
+                Arc::new(FileWriter::new_separated(paths))
+            } else {
+                Arc::new(FileWriter::new_unified(&file_config.path))
+            }
         } else {
-            5000
+            Arc::new(FileWriter::new_noop())
         };
-        let cache = Caches::new(cache_size);
+
+        // Build filters for inline processing in download tasks
         let filters = if let Some(ref collect) = config.collect {
-            if let Some(filter_config) = &collect.filter {
+            if let Some(ref filter_config) = collect.filter {
                 filter_config.get_filters()
             } else {
                 HashMap::new()
@@ -136,30 +106,35 @@ impl Collector {
             HashMap::new()
         };
 
+        let (result_rx, stats_rx, kill_tx, task_handles) =
+            get_available_content(api,
+                                  content_types_config,
+                                  runs.clone(),
+                                  &config,
+                                  known_blobs.clone(),
+                                  state,
+                                  file_writer.clone(),
+                                  filters).await;
+
         let collector = Collector {
             config,
             tenant_id,
-            interfaces,
             result_rx,
             stats_rx,
             known_blobs,
             saved: 0,
             kill_tx,
-            filters,
-            cache
+            file_writer,
+            task_handles,
         };
         Ok(collector)
     }
 
-    /// Monitor all started content retrieval threads, processing results and terminating
-    /// when all content has been retrieved (signalled by a final run stats message).
-    ///
-    /// SAFETY: Has a default 30-minute maximum timeout to prevent infinite hangs.
-    /// This can be overridden with the globalTimeout config option.
+    /// Monitor all started content retrieval threads.
+    /// MEMORY FIX: No longer processes JSON data — only receives log counts.
     pub async fn monitor(&mut self) {
 
         let start = Instant::now();
-        // Default timeout of 30 minutes if not configured - prevents infinite hangs
         const DEFAULT_TIMEOUT_MINUTES: usize = 30;
 
         loop {
@@ -172,26 +147,20 @@ impl Collector {
             let elapsed_minutes = start.elapsed().as_secs().div(60) as usize;
             if timeout_minutes > 0 && elapsed_minutes >= timeout_minutes {
                 warn!(
-                    "Global timeout expired after {} minutes. Requesting collector stop. \
-                     This may indicate stale state files or API issues.",
+                    "Global timeout expired after {} minutes. Requesting collector stop.",
                     elapsed_minutes
                 );
                 let _ = self.kill_tx.send(true).await;
-                // Give message loop time to process kill signal
                 sleep(Duration::from_secs(2)).await;
                 break;
             }
 
-            // Run stats are only returned when all content has been retrieved,
-            // therefore this signals the end of the run.
             if self.check_stats().await {
                 break
             }
 
-            // Check if a log came in.
             self.check_results().await;
 
-            // Small yield to prevent CPU spinning
             sleep(Duration::from_millis(10)).await;
         }
         self.check_all_results().await;
@@ -199,7 +168,10 @@ impl Collector {
     }
 
     pub async fn end_run(&mut self) {
-        // Save known blobs using memory-efficient cache
+        // Flush all file writers to ensure all data is on disk
+        self.file_writer.flush_all();
+
+        // Save known blobs
         let working_dir = self.config.get_working_dir();
         let known_blobs_path = Path::new(&working_dir).join("known_blobs");
         if let Err(e) = self.known_blobs.save_to_file(&known_blobs_path).await {
@@ -227,74 +199,52 @@ impl Collector {
                 }
             }
         }
+
+        // CRITICAL: Abort AND await background tasks to prevent memory leaks.
+        // The blob collector task has a self-referential channel (blobs_tx/blobs_rx)
+        // and will hang forever if not explicitly aborted. We must AWAIT each handle
+        // after aborting to guarantee tokio fully drops the task state machine
+        // (async future + all captured data). Without await, tokio may defer cleanup
+        // and the ~42MB of task state per cycle accumulates indefinitely.
+        for handle in self.task_handles.drain(..) {
+            handle.abort();
+            let _ = handle.await; // Wait for tokio to fully drop task state
+        }
     }
 
+    /// MEMORY FIX: Now receives (usize, ContentToRetrieve) — a count, not data.
     pub async fn check_results(&mut self) -> usize {
-
-        if let Ok(Some((msg, content))) = self.result_rx.try_next() {
-            self.handle_content(msg, content).await
+        if let Ok(Some((count, content))) = self.result_rx.try_next() {
+            self.handle_content(count, content).await
         } else {
             0
         }
     }
 
     pub async fn check_all_results(&mut self) -> usize {
-
         let mut amount = 0;
-        while let Ok(Some((msg, content))) = self.result_rx.try_next() {
-            amount += self.handle_content(msg, content).await;
+        while let Ok(Some((count, content))) = self.result_rx.try_next() {
+            amount += self.handle_content(count, content).await;
         }
         amount
     }
 
-    async fn handle_content(&mut self, msg: String, content: ContentToRetrieve) -> usize {
-        // Insert into memory-efficient LRU cache with TTL
+    /// MEMORY FIX: No JSON parsing here. Just update known_blobs for dedup and track count.
+    async fn handle_content(&mut self, count: usize, content: ContentToRetrieve) -> usize {
         self.known_blobs.insert(content.content_id.clone(), &content.expiration).await;
-
-        if let Ok(logs) = serde_json::from_str::<JsonList>(&msg) {
-            let amount = logs.len();
-            for log in logs {
-                self.handle_log(log, &content).await;
-            }
-            amount
-        } else {
-            warn!("Skipped log that could not be parsed: {}", content.content_id);
-            0
-        }
+        self.saved += count;
+        count
     }
 
-    async fn handle_log(&mut self, mut log: ArbitraryJson, content: &ContentToRetrieve) {
-
-        // Filter by subscription name - trust Microsoft's subscription assignment
-        // Each log from Microsoft includes a "Subscription" field
-        // If we subscribed to "DLP.All", all logs from that feed are DLP logs (RecordType 11, 13, 28, etc.)
-        // No need to filter by RecordType - Microsoft already categorizes them correctly
-
-        if let Some(filters) = self.filters.get(&content.content_type) {
-            for (k, v) in filters.iter() {
-                if let Some(val) = log.get(k) {
-                    if val != v {
-                        return
-                    }
-                }
-            }
-        }
-        log.insert("OriginFeed".to_string(),
-                   Value::String(content.content_type.to_string()));
-        self.cache.insert(log, &content.content_type);
-        self.saved += 1;
-        if self.cache.full() {
-            self.output().await;
-        }
-    }
     pub async fn check_stats(&mut self) -> bool {
-
         if let Ok(Some((found,
                         successful,
                         retried,
                         failed))) = self.stats_rx.try_next() {
 
-            self.output().await;
+            // Flush file writer to ensure all data is on disk before reporting stats
+            self.file_writer.flush_all();
+
             let output = self.get_output_string(
                 found,
                 successful,
@@ -306,19 +256,6 @@ impl Collector {
             true
         } else {
             false
-        }
-    }
-
-    async fn output(&mut self) {
-
-        let mut cache = Caches::new(self.cache.size);
-        swap(&mut self.cache, &mut cache);
-        if self.interfaces.len() == 1 {
-            self.interfaces.get_mut(0).unwrap().send_logs(cache).await;
-        } else {
-            for interface in self.interfaces.iter_mut() {
-                interface.send_logs(cache.clone()).await;
-            }
         }
     }
 
@@ -338,33 +275,26 @@ Logs saved: {}",
 }
 
 
-/// Initialize a config object for each sub thread to run
-/// - Blob thread: Collect available content blobs
-/// - Content thread: Collect the blobs found by blob thread
-/// - Message loop: Communicates with other threads to handle retries and terminate when finished
+/// Initialize channels for inter-task communication.
+///
+/// MEMORY FIX: result channel now carries (usize, ContentToRetrieve) not (String, ContentToRetrieve).
+/// FileWriter and filters are passed through to GetContentConfig for inline processing.
 fn initialize_channels(
     api: ApiConnection, content_types: ContentTypesSubConfig,
-    runs: HashMap<String, Vec<(String, String)>>, config: &Config)
+    runs: HashMap<String, Vec<(String, String)>>, config: &Config,
+    file_writer: Arc<FileWriter>,
+    filters: HashMap<String, ArbitraryJson>)
     -> (data_structures::GetBlobConfig,
         data_structures::GetContentConfig,
         data_structures::MessageLoopConfig,
         Receiver<(String, String)>,
         Receiver<ContentToRetrieve>,
-        Receiver<(String, ContentToRetrieve)>,
+        Receiver<(usize, ContentToRetrieve)>,
         Receiver<(usize, usize, usize, usize)>,
         tokio::sync::mpsc::Sender<bool>) {
 
     let urls = api.create_base_urls(runs);
 
-    // Create channels to communicate with async closures
-    //
-    // MEMORY FIX: Channel capacities reduced to prevent excessive in-flight memory.
-    // - result_tx (500): Each item holds a full JSON response body (~100KB-10MB).
-    //   At 10,000 capacity, worst case was ~1GB in the channel alone. 500 items
-    //   provides ~5s of buffer at 100 items/sec consumption. Producers block (backpressure)
-    //   when full — no data loss, just pacing.
-    // - Other channels (2000): Hold small structs (URLs, status enums, ContentToRetrieve).
-    //   2000 is generous for coordination messages.
     let (status_tx, status_rx):
         (Sender<data_structures::StatusMessage>,
          Receiver<data_structures::StatusMessage>) = channel(2000);
@@ -385,9 +315,11 @@ fn initialize_channels(
         (Sender<ContentToRetrieve>,
          Receiver<ContentToRetrieve>) = channel(2000);
 
+    // MEMORY FIX: Channel now carries (count, metadata) not (full_response_body, metadata).
+    // Capacity 500 is generous — each item is ~200 bytes (usize + ContentToRetrieve).
     let (result_tx, result_rx):
-        (Sender<(String, ContentToRetrieve)>,
-         Receiver<(String, ContentToRetrieve)>) = channel(500);
+        (Sender<(usize, ContentToRetrieve)>,
+         Receiver<(usize, ContentToRetrieve)>) = channel(500);
 
     let (stats_tx, stats_rx):
         (Sender<(usize, usize, usize, usize)>,
@@ -396,11 +328,6 @@ fn initialize_channels(
     let (kill_tx, kill_rx): (tokio::sync::mpsc::Sender<bool>,
                              tokio::sync::mpsc::Receiver<bool>) = tokio::sync::mpsc::channel(10);
 
-    // MEMORY FIX: Default concurrent downloads reduced from 50 to 10.
-    // Each concurrent download holds an entire response body in memory (~1-10MB)
-    // plus the deserialized JSON (~3-5x expansion). At 50 threads, peak memory for
-    // in-flight downloads alone was ~300MB-3GB. At 10 threads, peak is ~60-300MB.
-    // No data loss: downloads are simply paced, not dropped.
     let max_threads = config.collect.as_ref()
         .and_then(|c| c.max_threads)
         .unwrap_or(10);
@@ -411,7 +338,6 @@ fn initialize_channels(
         .and_then(|c| c.retries)
         .unwrap_or(3);
 
-    // Create HTTP client
     let client = reqwest::Client::new();
 
     let blob_config = data_structures::GetBlobConfig {
@@ -431,6 +357,8 @@ fn initialize_channels(
         status_tx: status_tx.clone(),
         threads: max_threads,
         max_response_size: config.get_max_size_bytes(),
+        file_writer,
+        filters,
     };
 
     let message_loop_config = data_structures::MessageLoopConfig {
@@ -450,21 +378,22 @@ fn initialize_channels(
 }
 
 
-/// Get all the available log content for a list of content types and runs (start- and end times
-/// of content to receive).
+/// Get all the available log content.
 ///
-/// MEMORY FIX: Now runs all collectors as async tasks on the existing runtime instead of
-/// spawning separate threads with their own #[tokio::main] runtimes. This eliminates
-/// the 70+ worker threads that were being created per tenant per collection.
+/// MEMORY FIX: Accepts FileWriter and filters to pass through to content download tasks.
+/// TASK LIFECYCLE FIX: Returns task handles so they can be aborted on cleanup.
 async fn get_available_content(api: ApiConnection,
                          content_types: ContentTypesSubConfig,
                          runs: HashMap<String, Vec<(String, String)>>,
                          config: &Config,
                          known_blobs: SharedKnownBlobsCache,
-                         state: Arc<Mutex<RunState>>)
-                         -> (Receiver<(String, ContentToRetrieve)>,
+                         state: Arc<Mutex<RunState>>,
+                         file_writer: Arc<FileWriter>,
+                         filters: HashMap<String, ArbitraryJson>)
+                         -> (Receiver<(usize, ContentToRetrieve)>,
                              Receiver<(usize, usize, usize, usize)>,
-                             tokio::sync::mpsc::Sender<bool>) {
+                             tokio::sync::mpsc::Sender<bool>,
+                             Vec<tokio::task::JoinHandle<()>>) {
 
     let (blob_config,
         content_config,
@@ -473,9 +402,9 @@ async fn get_available_content(api: ApiConnection,
         content_rx,
         result_rx,
         stats_rx,
-        kill_tx) = initialize_channels(api, content_types, runs, config);
+        kill_tx) = initialize_channels(api, content_types, runs, config, file_writer, filters);
 
-    spawn_blob_collector(blob_config,
+    let task_handles = spawn_blob_collector(blob_config,
                          content_config,
                          message_loop_config,
                          blobs_rx,
@@ -483,15 +412,12 @@ async fn get_available_content(api: ApiConnection,
                          known_blobs,
                          state);
 
-    (result_rx, stats_rx, kill_tx)
+    (result_rx, stats_rx, kill_tx, task_handles)
 }
 
 
 /// Spawn async tasks for collectors on the existing Tokio runtime.
-///
-/// MEMORY FIX: Previously spawned 3 OS threads, each with their own #[tokio::main] runtime
-/// creating 20+50+default worker threads (70+ total). Now uses tokio::spawn to run as
-/// lightweight async tasks on the existing runtime, drastically reducing memory and thread overhead.
+/// Returns JoinHandles so tasks can be aborted on cleanup (prevents 42MB/cycle leak).
 fn spawn_blob_collector(
     blob_config: data_structures::GetBlobConfig,
     content_config: data_structures::GetContentConfig,
@@ -499,44 +425,30 @@ fn spawn_blob_collector(
     blobs_rx: Receiver<(String, String)>,
     content_rx: Receiver<ContentToRetrieve>,
     known_blobs: SharedKnownBlobsCache,
-    state: Arc<Mutex<RunState>>) {
+    state: Arc<Mutex<RunState>>) -> Vec<tokio::task::JoinHandle<()>> {
 
     info!("Spawning collector tasks on shared runtime");
 
-    // MEMORY FIX: Pass the SharedKnownBlobsCache directly instead of cloning to HashMap.
-    // Previously, to_hashmap() materialized the entire LRU cache (~8000 entries) into a
-    // plain HashMap, and then each concurrent blob task cloned that HashMap again
-    // (50 clones × ~1.5MB each = ~75MB). Now we pass the Arc-wrapped cache directly;
-    // cloning just increments the Arc refcount. The live cache also means newly-discovered
-    // blobs are immediately visible for dedup, which is strictly more correct.
-    tokio::spawn(async move {
+    let h1 = tokio::spawn(async move {
         api_connection::get_content_blobs_async(blob_config, blobs_rx, known_blobs).await;
     });
 
-    // Spawn content collector as async task
-    tokio::spawn(async move {
+    let h2 = tokio::spawn(async move {
         api_connection::get_content_async(content_config, content_rx).await;
     });
 
-    // Spawn message loop as async task
-    tokio::spawn(async move {
+    let h3 = tokio::spawn(async move {
         message_loop(message_loop_config, state).await;
     });
+
+    vec![h1, h2, h3]
 }
 
 
-/// Receive status updates to keep track of when all content has been retrieved. Also handle
-/// retrying any failed content or dropping it after too many retries. Every time content is foudn
-/// awaiting_content_blobs is incremented; every time content is retrieved or could not be
-/// retrieved awaiting_content_blobs is decremented. When it reaches 0 we know we are done.
-///
-/// MEMORY FIX: Removed #[tokio::main] - now runs as an async task on the shared runtime
-/// instead of creating its own runtime with additional worker threads.
-/// Also added bounded retry_map to prevent unbounded memory growth on persistent failures.
+/// Message loop: track progress and terminate when all content is retrieved.
 pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                           mut state: Arc<Mutex<RunState>>) {
 
-    // Send base URLS for content blob retrieval then keep track of when they've all come in
     for (content_type, base_url) in config.urls.into_iter() {
         config.blobs_tx.clone().send((content_type, base_url)).await.unwrap();
         state.lock().await.awaiting_content_types += 1;
@@ -544,14 +456,10 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
 
     let mut rate_limit_backoff_started: Option<Instant> = None;
 
-    // MEMORY FIX: Use bounded LRU cache for retry tracking to prevent unbounded growth
-    // on persistent failures. Max 50,000 entries should be more than enough for any
-    // reasonable collection run.
     const MAX_RETRY_ENTRIES: usize = 50_000;
     let mut retry_map: lru::LruCache<String, usize> =
         lru::LruCache::new(std::num::NonZeroUsize::new(MAX_RETRY_ENTRIES).unwrap());
 
-    // Loop ends with the run itself, signalling the program is done.
     loop {
 
         if let Some(t) = rate_limit_backoff_started {
@@ -562,28 +470,19 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
             }
         }
 
-
         if let Ok(msg) = config.kill_rx.try_recv() {
             if msg {
                 info!("Stopping collector.");
                 break
             }
         }
-        // Receive status message indicated found content and retrieved content. When all blobs have
-        // been found, and all found blobs have been retrieved, we are done.
+
         if let Ok(Some(msg)) = config.status_rx.try_next() {
             match msg {
-                // We have found a new content blob while iterating through the pages of them.
-                // It has been queued up to be retrieved.
                 data_structures::StatusMessage::FoundNewContentBlob => {
                     state.lock().await.awaiting_content_blobs +=1;
                     state.lock().await.stats.blobs_found += 1;
                 },
-                // awaiting_content_types is initially the size of content type * runs for each
-                // content type. When retrieving pages if we don't get a NextPageUri response
-                // header, we know we have found all possible blobs for that content type and
-                // we decrement awaiting_content_types. When it hits 0 we know we found all
-                // content that can possible be retrieved.
                 data_structures::StatusMessage::FinishedContentBlobs => {
                     let new_content_types = state.lock().await.awaiting_content_types.saturating_sub(1);
                     state.lock().await.awaiting_content_types = new_content_types;
@@ -591,9 +490,6 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                         break
                     }
                 },
-                // A queued up content blob has actually been retrieved so we are done with it.
-                // When awaiting_content_blobs hits 0 we are done retrieving all actual content
-                // and we can exit.
                 data_structures::StatusMessage::RetrievedContentBlob => {
                     state.lock().await.awaiting_content_blobs -= 1;
                     state.lock().await.stats.blobs_successful += 1;
@@ -602,9 +498,6 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                         break;
                     }
                 },
-                // A queued up content blob could not be retrieved so we are done with it.
-                // When awaiting_content_blobs hits 0 we are done retrieving all actual content
-                // and we can exit.
                 data_structures::StatusMessage::ErrorContentBlob => {
                     state.lock().await.awaiting_content_blobs -= 1;
                     state.lock().await.stats.blobs_error += 1;
@@ -622,15 +515,17 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                 }
             }
         }
-        // Check channel for content pages that could not be retrieved and retry them the user
-        // defined amount of times. If we can't in that amount of times then give up.
+
         if let Ok(Some((content_type, url))) = config.blob_error_rx.try_next() {
             if let Some(retries_left) = retry_map.get_mut(&url) {
                 if *retries_left == 0 {
                     error!("Gave up on blob {}", url);
-                    retry_map.pop(&url); // Clean up exhausted entry
+                    retry_map.pop(&url);
                     state.lock().await.awaiting_content_types -= 1;
                     state.lock().await.stats.blobs_error += 1;
+                    if check_done(&mut state).await {
+                        break;
+                    }
                 } else {
                     if rate_limit_backoff_started.is_none() {
                         *retries_left -= 1;
@@ -647,16 +542,19 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                 config.blobs_tx.send((content_type, url)).await.unwrap();
             }
         };
-        // Check channel for content blobs that could not be retrieved and retry them the user
-        // defined amount of times. If we can't in that amount of times then give up.
+
         if let Ok(Some(content)) = config.content_error_rx.try_next() {
             state.lock().await.stats.blobs_retried += 1;
             if let Some(retries_left) = retry_map.get_mut(&content.url) {
                 if *retries_left == 0 {
                     error!("Gave up on content {}", content.url);
-                    retry_map.pop(&content.url); // Clean up exhausted entry
+                    retry_map.pop(&content.url);
                     state.lock().await.awaiting_content_blobs -= 1;
                     state.lock().await.stats.blobs_error += 1;
+                    if check_done(&mut state).await {
+                        config.content_tx.close_channel();
+                        break;
+                    }
                 } else {
                     if rate_limit_backoff_started.is_none() {
                         *retries_left -= 1;
@@ -672,10 +570,10 @@ pub async fn message_loop(mut config: data_structures::MessageLoopConfig,
                 config.content_tx.send(content).await.unwrap();
             }
         }
-        // Sleep briefly to prevent CPU spinning in busy-wait loop
+
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
-    // We send back stats after exiting the loop, signalling the end of the run.
+
     let stats = state.lock().await.stats.clone();
     sleep(Duration::from_secs(3)).await;
     config.stats_tx.send((

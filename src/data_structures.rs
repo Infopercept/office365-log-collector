@@ -1,9 +1,13 @@
 use futures::channel::mpsc::{Sender, Receiver};
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use reqwest::header::HeaderMap;
 use serde_derive::Deserialize;
 use clap::Parser;
-use log::warn;
+use log::{info, warn};
 use serde_json::Value;
 use crate::config::ContentTypesSubConfig;
 
@@ -113,15 +117,19 @@ pub struct GetBlobConfig {
 }
 
 
-/// Used by thread getting content
+/// Used by thread getting content.
+/// MEMORY FIX: result_tx now carries (usize, ContentToRetrieve) — a log count, not
+/// a multi-MB response body String. Processing happens inline in the download task.
 pub struct GetContentConfig {
     pub client: reqwest::Client,
     pub headers: HeaderMap,
-    pub result_tx: Sender<(String, ContentToRetrieve)>,
+    pub result_tx: Sender<(usize, ContentToRetrieve)>,
     pub content_error_tx: Sender<ContentToRetrieve>,
     pub status_tx: Sender<StatusMessage>,
     pub threads: usize,
-    pub max_response_size: Option<usize>,  // Maximum response size in bytes
+    pub max_response_size: Option<usize>,
+    pub file_writer: Arc<FileWriter>,
+    pub filters: HashMap<String, ArbitraryJson>,
 }
 
 
@@ -190,4 +198,124 @@ pub struct CliArgs {
 
     #[arg(short, long, required = false, help = "Interactive interface for (load) testing.")]
     pub interactive: bool,
+}
+
+
+/// Thread-safe JSONL file writer that download tasks use to write logs directly to disk.
+/// Eliminates in-memory buffering by writing each log entry as it's parsed.
+///
+/// Each content type has its own Mutex<BufWriter<File>> so concurrent download tasks
+/// writing to DIFFERENT content types don't contend. Same-type writes serialize on the
+/// Mutex (correct, since file appends must be ordered).
+pub struct FileWriter {
+    writers: HashMap<String, StdMutex<BufWriter<std::fs::File>>>,
+    unified_writer: Option<StdMutex<BufWriter<std::fs::File>>>,
+    separate: bool,
+}
+
+impl FileWriter {
+    /// Create a FileWriter with separate files per content type.
+    pub fn new_separated(paths: HashMap<String, String>) -> Self {
+        let mut writers = HashMap::new();
+        for (content_type, path) in &paths {
+            // Ensure parent directory exists
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|e| panic!("Cannot open output file '{}': {}", path, e));
+            writers.insert(
+                content_type.clone(),
+                StdMutex::new(BufWriter::with_capacity(64 * 1024, file)),
+            );
+            info!("FileWriter: opened {} for {}", path, content_type);
+        }
+        FileWriter { writers, unified_writer: None, separate: true }
+    }
+
+    /// Create a FileWriter with a single unified output file.
+    pub fn new_unified(path: &str) -> Self {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("Cannot open output file '{}': {}", path, e));
+        info!("FileWriter: opened {} (unified)", path);
+        FileWriter {
+            writers: HashMap::new(),
+            unified_writer: Some(StdMutex::new(BufWriter::with_capacity(64 * 1024, file))),
+            separate: false,
+        }
+    }
+
+    /// Create an empty/no-op FileWriter (when no file output is configured).
+    pub fn new_noop() -> Self {
+        FileWriter {
+            writers: HashMap::new(),
+            unified_writer: None,
+            separate: false,
+        }
+    }
+
+    /// Write a single JSONL line for a given content type.
+    pub fn write_log(&self, content_type: &str, json_line: &str) -> std::io::Result<()> {
+        if self.separate {
+            if let Some(mutex) = self.writers.get(content_type) {
+                let mut writer = mutex.lock().unwrap();
+                writer.write_all(json_line.as_bytes())?;
+                writer.write_all(b"\n")?;
+            }
+        } else if let Some(ref mutex) = self.unified_writer {
+            let mut writer = mutex.lock().unwrap();
+            writer.write_all(json_line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    /// Flush all buffered writers. Call at end of each collection run.
+    pub fn flush_all(&self) {
+        for (_, mutex) in &self.writers {
+            if let Ok(mut w) = mutex.lock() {
+                let _ = w.flush();
+            }
+        }
+        if let Some(ref mutex) = self.unified_writer {
+            if let Ok(mut w) = mutex.lock() {
+                let _ = w.flush();
+            }
+        }
+    }
+
+    /// Build output file paths for separate-by-content-type mode.
+    pub fn build_separated_paths(base_path: &str, subscriptions: &[String]) -> HashMap<String, String> {
+        let path = Path::new(base_path);
+        let dir = path.parent();
+        let mut paths = HashMap::new();
+        for content_type in subscriptions {
+            let filename = format!("{}.json", content_type.replace('.', ""));
+            let full_path = if let Some(parent) = dir {
+                let parent_str = parent.to_str().unwrap();
+                if parent_str.is_empty() {
+                    PathBuf::from(&filename)
+                } else {
+                    parent.join(&filename)
+                }
+            } else {
+                PathBuf::from(&filename)
+            };
+            paths.insert(content_type.clone(), full_path.to_string_lossy().to_string());
+        }
+        paths
+    }
 }
